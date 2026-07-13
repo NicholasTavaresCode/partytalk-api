@@ -1,0 +1,62 @@
+services:
+  firestore:
+    image: andreysenov/firebase-tools:latest
+    working_dir: /home/node
+    command: >
+      firebase emulators:start --only firestore
+      --project ${GCP_PROJECT_ID:-demo}
+    ports:
+      - "8200:8080" # emulator exposed on host:8200 (optional, for debugging)
+    volumes:
+      - ./firebase.json:/home/node/firebase.json:ro
+      - ./firestore.rules:/home/node/firestore.rules:ro
+    healthcheck:
+      # node is always present (firebase-tools is a node CLI); curl may not be.
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "require('http').get('http://localhost:8080/',r=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  api:
+    build: .
+    # Load the app's configuration from .env into the container. `required: false`
+    # so the stack still comes up (on defaults) if no .env is present yet.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Container-specific overrides — these WIN over anything in .env.
+      # The runtime image is built with `npm install --omit=dev`, so pino-pretty
+      # (a devDependency) is absent; keep production logging to avoid a crash.
+      NODE_ENV: production
+      # main.ts reads PORT; the image EXPOSEs 8080, so listen there internally.
+      PORT: 8080
+      # Talk to the emulator service over the compose network, not real Firestore.
+      # With this set, the app skips real credentials for Firestore (see firebase-app.ts).
+      FIRESTORE_EMULATOR_HOST: firestore:8080
+      # Only needed for Vertex AI calls; Firestore uses the emulator above.
+      GOOGLE_APPLICATION_CREDENTIALS: /gcp/adc.json
+    ports:
+      # Host port comes from PORT in .env (default 3000) -> container's 8080.
+      - "${PORT:-3000}:8080"
+    depends_on:
+      firestore:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "require('http').get('http://localhost:8080/api/v1/health/live',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    volumes:
+      # Host ADC from `gcloud auth application-default login` (read-only, optional).
+      # Only required if you exercise Vertex AI (AI host / IELTS scoring) locally.
+      - ${HOME}/.config/gcloud/application_default_credentials.json:/gcp/adc.json:ro
