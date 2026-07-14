@@ -20,7 +20,7 @@ import {
 } from '@nestjs/swagger';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
-import { AuthenticatedUser } from '../common/interfaces/authenticated-user.interface';
+import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-principal.interface';
 import { ApiEnvelopeResponse } from '../common/swagger/api-envelope';
 import { ErrorResponseDto } from '../common/swagger/error-response.dto';
 import { CreateRoomDto } from './dto/create-room.dto';
@@ -38,16 +38,16 @@ const ROOM_ID_PARAM = {
 } as const;
 
 /**
- * REST surface for rooms. Every route is behind the global FirebaseAuthGuard,
+ * REST surface for rooms. Every route is behind the global GoogleAuthGuard,
  * so the caller's uid always comes from the verified token (never the body) —
  * ownership/participation checks live in the service. Realtime voice flows over
  * the Socket.IO `rooms` namespace; these endpoints own persistence, the manual
  * facilitator trigger, and reads.
  */
 @ApiTags('Rooms')
-@ApiBearerAuth('firebase')
+@ApiBearerAuth('google')
 @ApiUnauthorizedResponse({
-  description: 'Missing, malformed, or expired Firebase token.',
+  description: 'Missing, malformed, or invalid Google ID token.',
   type: ErrorResponseDto,
 })
 @Controller({ path: 'rooms', version: '1' })
@@ -63,7 +63,10 @@ export class RoomsController {
     description:
       'Opens a new practice room owned by the caller. The room starts in `waiting` status with the owner as its sole participant. `facilitatorPersona` and `maxParticipants` default when omitted. The AI facilitator stays silent until people begin talking.',
   })
-  @ApiEnvelopeResponse(Room, { created: true, description: 'The created room.' })
+  @ApiEnvelopeResponse(Room, {
+    created: true,
+    description: 'The created room.',
+  })
   create(
     @CurrentUser('uid') uid: string,
     @Body() dto: CreateRoomDto,
@@ -93,7 +96,10 @@ export class RoomsController {
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, { description: 'The requested room.' })
-  @ApiNotFoundResponse({ type: ErrorResponseDto, description: 'Room not found.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
   getOne(@Param('id') id: string): Promise<Room> {
     return this.roomsService.getRoom(id);
   }
@@ -106,12 +112,18 @@ export class RoomsController {
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, { description: 'The room including the caller.' })
-  @ApiNotFoundResponse({ type: ErrorResponseDto, description: 'Room not found.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
   @ApiConflictResponse({
     type: ErrorResponseDto,
     description: 'Room is full or already ended.',
   })
-  join(@Param('id') id: string, @CurrentUser('uid') uid: string): Promise<Room> {
+  join(
+    @Param('id') id: string,
+    @CurrentUser('uid') uid: string,
+  ): Promise<Room> {
     return this.roomsService.joinRoom(id, uid);
   }
 
@@ -123,7 +135,10 @@ export class RoomsController {
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, { description: 'The room without the caller.' })
-  @ApiNotFoundResponse({ type: ErrorResponseDto, description: 'Room not found.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
   leave(
     @Param('id') id: string,
     @CurrentUser('uid') uid: string,
@@ -139,7 +154,10 @@ export class RoomsController {
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, { description: 'The now-live room.' })
-  @ApiNotFoundResponse({ type: ErrorResponseDto, description: 'Room not found.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
   @ApiForbiddenResponse({
     type: ErrorResponseDto,
     description: 'Only the room owner may start/end the room.',
@@ -161,7 +179,10 @@ export class RoomsController {
   @ApiEnvelopeResponse(Room, {
     description: 'The ended room, including its report when available.',
   })
-  @ApiNotFoundResponse({ type: ErrorResponseDto, description: 'Room not found.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
   @ApiForbiddenResponse({
     type: ErrorResponseDto,
     description: 'Only the room owner may start/end the room.',
@@ -186,7 +207,10 @@ export class RoomsController {
     isArray: true,
     description: 'Transcript segments, oldest first.',
   })
-  @ApiNotFoundResponse({ type: ErrorResponseDto, description: 'Room not found.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
   getTranscript(
     @Param('id') id: string,
     @Query() query: PaginationQueryDto,
@@ -206,10 +230,13 @@ export class RoomsController {
     created: true,
     description: 'The stored transcript segment.',
   })
-  @ApiNotFoundResponse({ type: ErrorResponseDto, description: 'Room not found.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
   addTranscript(
     @Param('id') id: string,
-    @CurrentUser() user: AuthenticatedUser,
+    @CurrentUser() user: AuthenticatedPrincipal,
     @Body() dto: PostTranscriptDto,
   ): Promise<TranscriptSegment> {
     return this.roomsService.addTranscriptSegment(
@@ -231,7 +258,10 @@ export class RoomsController {
     created: true,
     description: 'The generated topic suggestion.',
   })
-  @ApiNotFoundResponse({ type: ErrorResponseDto, description: 'Room not found.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
   suggestTopic(@Param('id') id: string): Promise<TopicSuggestion> {
     return this.roomsService.generateTopicSuggestion(id, 'manual');
   }
@@ -247,7 +277,10 @@ export class RoomsController {
     isArray: true,
     description: 'Topic suggestions, oldest first.',
   })
-  @ApiNotFoundResponse({ type: ErrorResponseDto, description: 'Room not found.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
   getSuggestions(
     @Param('id') id: string,
     @Query() query: PaginationQueryDto,

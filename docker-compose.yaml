@@ -41,8 +41,8 @@ services:
       # Only needed for Vertex AI calls; Firestore uses the emulator above.
       GOOGLE_APPLICATION_CREDENTIALS: /gcp/adc.json
     ports:
-      # Host port comes from PORT in .env (default 3000) -> container's 8080.
-      - "${PORT:-3000}:8080"
+      # Host port comes from PORT in .env (default 8080) -> container's 8080.
+      - "${PORT:-8080}:8080"
     depends_on:
       firestore:
         condition: service_healthy

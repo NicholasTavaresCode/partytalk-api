@@ -34,9 +34,9 @@ import { IeltsService } from './ielts.service';
  * attempts — ownership is re-checked in the service (no IDOR surface).
  */
 @ApiTags('IELTS')
-@ApiBearerAuth('firebase')
+@ApiBearerAuth('google')
 @ApiUnauthorizedResponse({
-  description: 'Missing, malformed, or expired Firebase token.',
+  description: 'Missing, malformed, or invalid Google ID token.',
   type: ErrorResponseDto,
 })
 @Controller({ path: 'ielts', version: '1' })

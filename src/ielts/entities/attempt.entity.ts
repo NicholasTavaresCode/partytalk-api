@@ -86,8 +86,8 @@ export class IeltsAttempt {
   id!: string;
 
   @ApiProperty({
-    description: 'Firebase UID of the learner who owns this attempt.',
-    example: 'aXbQ1m9Zt0Yc3kLpR7sVwE2fH1',
+    description: 'Google account `sub` of the learner who owns this attempt.',
+    example: '110169484474386276334',
   })
   userId!: string;
 

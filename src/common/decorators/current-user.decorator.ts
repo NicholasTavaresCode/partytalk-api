@@ -3,22 +3,24 @@ import {
   ExecutionContext,
   InternalServerErrorException,
 } from '@nestjs/common';
-import { AuthenticatedUser } from '../interfaces/authenticated-user.interface';
+import { AuthenticatedPrincipal } from '../interfaces/authenticated-principal.interface';
 
 /**
- * Extracts the authenticated user placed on the request by FirebaseAuthGuard.
+ * Extracts the authenticated principal placed on the request by GoogleAuthGuard.
  * Throws if used on a route that is not behind the guard — a programming error
  * we want to surface loudly rather than silently returning undefined.
  *
- * Usage: `@CurrentUser() user: AuthenticatedUser` or `@CurrentUser('uid') uid: string`.
+ * Usage: `@CurrentUser() user: AuthenticatedPrincipal` or `@CurrentUser('uid') uid: string`.
  */
 export const CurrentUser = createParamDecorator(
   (
-    data: keyof AuthenticatedUser | undefined,
+    data: keyof AuthenticatedPrincipal | undefined,
     ctx: ExecutionContext,
-  ): AuthenticatedUser | AuthenticatedUser[keyof AuthenticatedUser] => {
+  ):
+    | AuthenticatedPrincipal
+    | AuthenticatedPrincipal[keyof AuthenticatedPrincipal] => {
     const request = ctx.switchToHttp().getRequest();
-    const user: AuthenticatedUser | undefined = request.user;
+    const user: AuthenticatedPrincipal | undefined = request.user;
 
     if (!user) {
       throw new InternalServerErrorException(

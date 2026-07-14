@@ -6,10 +6,17 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
  * the Swagger UI. Keep tag names in sync with the `@ApiTags(...)` on controllers.
  */
 const TAG_DESCRIPTIONS: Array<[name: string, description: string]> = [
-  ['Health', 'Liveness and readiness probes for orchestration and uptime checks.'],
+  [
+    'Health',
+    'Liveness and readiness probes for orchestration and uptime checks.',
+  ],
+  [
+    'Auth',
+    'Identity resolved from the Google ID token. `GET /auth/me` echoes the authenticated principal so the frontend can drive identity-aware UI.',
+  ],
   [
     'Users',
-    'The authenticated user’s own learner profile (English level, IELTS target). Identity always comes from the verified Firebase token — never from the URL.',
+    'The authenticated user’s own learner profile (English level, IELTS target). Identity always comes from the verified Google ID token — never from the URL.',
   ],
   [
     'Rooms',
@@ -33,7 +40,7 @@ export function setupSwagger(app: INestApplication): void {
       [
         'Backend for PartyTalk — live group English-practice rooms with an AI host, plus a solo IELTS exam simulator.',
         '',
-        '**Authentication.** All endpoints require a Firebase ID token as `Authorization: Bearer <token>` unless explicitly public (the health probes). Click **Authorize** and paste a token.',
+        '**Authentication.** All endpoints require a Google Identity ("Sign in with Google") ID token as `Authorization: Bearer <token>` unless explicitly public (the health probes). Click **Authorize** and paste a token.',
         '',
         '**Response envelope.** Successful responses are wrapped as `{ "data": <payload>, "meta": { "timestamp": <ISO-8601> } }`. Errors use `{ statusCode, timestamp, path, message, error }`.',
         '',
@@ -48,9 +55,10 @@ export function setupSwagger(app: INestApplication): void {
         type: 'http',
         scheme: 'bearer',
         bearerFormat: 'JWT',
-        description: 'Firebase ID token obtained by the frontend after sign-in.',
+        description:
+          'Google Identity ID token obtained by the frontend after "Sign in with Google".',
       },
-      'firebase',
+      'google',
     );
 
   for (const [name, description] of TAG_DESCRIPTIONS) {

@@ -1,22 +1,29 @@
 import { Global, Module } from '@nestjs/common';
-import { FirebaseAuthGuard } from './firebase-auth.guard';
-import { FirebaseTokenVerifier } from './firebase-token-verifier';
-import { TokenVerifier } from './token-verifier';
+import { UsersModule } from '../users/users.module';
+import { AuthController } from './auth.controller';
+import { AuthService } from './auth.service';
+import { GoogleAuthGuard } from './google-auth.guard';
+import { GoogleIdTokenVerifier } from './google-id-token-verifier';
+import { IdTokenVerifier } from './id-token-verifier';
 import { WsAuthenticator } from './ws-authenticator';
 
 /**
- * Provides the TokenVerifier (bound to the Firebase implementation) and the
- * FirebaseAuthGuard. Global so the guard can be registered app-wide and any
- * module can rely on `req.user` being populated. Swapping identity providers
- * later means only rebinding the TokenVerifier token here.
+ * Wires Google Identity authentication. The IdTokenVerifier is bound to its
+ * Google implementation; AuthService turns a verified token into a principal
+ * (provisioning users via the UsersRepository from UsersModule). Global so the
+ * guard can be registered app-wide and any module can rely on `req.user`.
+ * Swapping identity providers later means only rebinding IdTokenVerifier here.
  */
 @Global()
 @Module({
+  imports: [UsersModule],
+  controllers: [AuthController],
   providers: [
-    { provide: TokenVerifier, useClass: FirebaseTokenVerifier },
-    FirebaseAuthGuard,
+    { provide: IdTokenVerifier, useClass: GoogleIdTokenVerifier },
+    AuthService,
+    GoogleAuthGuard,
     WsAuthenticator,
   ],
-  exports: [TokenVerifier, FirebaseAuthGuard, WsAuthenticator],
+  exports: [IdTokenVerifier, AuthService, GoogleAuthGuard, WsAuthenticator],
 })
 export class AuthModule {}

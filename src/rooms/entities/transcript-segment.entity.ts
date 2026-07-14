@@ -24,14 +24,16 @@ export class TranscriptSegment {
   roomId!: string;
 
   @ApiProperty({
-    description: 'Firebase UID of the participant who spoke this segment.',
-    example: 'aXbQ1m9Zt0Yc3kLpR7sVwE2fH1',
+    description:
+      'Google account `sub` of the participant who spoke this segment.',
+    example: '110169484474386276334',
   })
   speakerId!: string;
 
   @ApiProperty({
     required: false,
-    description: 'Display name of the speaker, if known (for nicer transcripts).',
+    description:
+      'Display name of the speaker, if known (for nicer transcripts).',
     example: 'Ada',
   })
   speakerName?: string;

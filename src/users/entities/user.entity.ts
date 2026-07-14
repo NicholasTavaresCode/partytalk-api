@@ -1,4 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
+import { AccountStatus } from '../../common/interfaces/authenticated-principal.interface';
 
 /** English proficiency band a learner self-selects, used to tailor room + exam difficulty. */
 export type EnglishLevel =
@@ -17,16 +18,20 @@ export const ENGLISH_LEVELS: EnglishLevel[] = [
 ];
 
 /**
- * A PartyTalk user. `id` is the Firebase Auth UID — we do not mint our own user
- * ids, keeping identity consistent across Auth, Firestore and realtime sockets.
+ * A PartyTalk user. `id` is the Google account `sub` — we do not mint our own
+ * user ids, keeping identity consistent across Google Identity, Firestore and
+ * realtime sockets. The record is JIT-provisioned on first login with just
+ * identity + `status`; the learner-profile fields (`displayName`,
+ * `englishLevel`, `targetIeltsBand`) are filled in later via `PUT /users/me`
+ * and so are optional here.
  *
  * Declared as a class (not an interface) so `@nestjs/swagger` can reflect it
  * into an OpenAPI schema; plain object literals remain structurally assignable.
  */
 export class User {
   @ApiProperty({
-    description: 'Firebase Auth UID — the stable primary key for the user.',
-    example: 'aXbQ1m9Zt0Yc3kLpR7sVwE2fH1',
+    description: 'Google account `sub` — the stable primary key for the user.',
+    example: '110169484474386276334',
   })
   id!: string;
 
@@ -38,19 +43,29 @@ export class User {
   email!: string;
 
   @ApiProperty({
+    enum: ['active', 'disabled'],
+    description:
+      'Account status. A disabled account is denied access at the guard.',
+    example: 'active',
+  })
+  status!: AccountStatus;
+
+  @ApiProperty({
+    required: false,
     description: 'Public display name shown in rooms.',
     example: 'Ada Lovelace',
     minLength: 1,
     maxLength: 60,
   })
-  displayName!: string;
+  displayName?: string;
 
   @ApiProperty({
+    required: false,
     enum: ENGLISH_LEVELS,
     description: 'Self-assessed English proficiency band.',
     example: 'intermediate',
   })
-  englishLevel!: EnglishLevel;
+  englishLevel?: EnglishLevel;
 
   @ApiProperty({
     required: false,

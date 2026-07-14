@@ -11,7 +11,7 @@ import {
 import { Server, Socket } from 'socket.io';
 import { WsAuthenticator } from '../auth/ws-authenticator';
 import { AppConfig } from '../config/configuration';
-import { AuthenticatedUser } from '../common/interfaces/authenticated-user.interface';
+import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-principal.interface';
 import { RoomReport } from './entities/room-report.entity';
 import { SuggestionTrigger } from './entities/topic-suggestion.entity';
 import { shouldSuggestByVolume } from './facilitator/facilitator-policy';
@@ -27,7 +27,7 @@ interface TranscriptPayload {
 }
 
 /** The authenticated user is attached to the socket at connection time. */
-type AuthedSocket = Socket & { data: { user?: AuthenticatedUser } };
+type AuthedSocket = Socket & { data: { user?: AuthenticatedPrincipal } };
 
 /** Per-room facilitator state kept in memory on this socket-server instance. */
 interface RoomState {
@@ -69,7 +69,7 @@ export class RoomsGateway implements OnGatewayConnection {
   }
 
   /**
-   * Authenticate the Firebase token at connection time and pin the identity to
+   * Authenticate the Google ID token at connection time and pin the identity to
    * the socket. Unauthenticated sockets are dropped immediately, so every
    * handler can trust `client.data.user` and never a client-supplied uid.
    */
@@ -192,7 +192,7 @@ export class RoomsGateway implements OnGatewayConnection {
     }
   }
 
-  private requireUser(client: AuthedSocket): AuthenticatedUser {
+  private requireUser(client: AuthedSocket): AuthenticatedPrincipal {
     const user = client.data.user;
     if (!user) {
       // Should not happen — handleConnection drops unauthenticated sockets.

@@ -37,7 +37,30 @@ async function bootstrap(): Promise<void> {
 
   const port = config.get('port', { infer: true });
   await app.listen(port);
-  app.get(Logger).log(`PartyTalk API listening on port ${port}`);
+
+  // Startup summary — makes the effective auth/CORS config obvious at a glance,
+  // so misconfig (wrong client id, missing origin) is caught without guessing.
+  const logger = app.get(Logger);
+  const env = config.get('env', { infer: true });
+  const corsOrigins = config.get('corsOrigins', { infer: true });
+  const auth = config.get('auth', { infer: true });
+
+  logger.log(
+    `PartyTalk API listening on http://localhost:${port}/api/v1 [${env}]`,
+  );
+  logger.log(`CORS allowed origins: ${corsOrigins.join(', ') || '(none)'}`);
+  if (auth.disabled) {
+    logger.warn(
+      'AUTH DISABLED (AUTH_DISABLED=true) — every request is treated as a dev user. Do not deploy like this.',
+    );
+  } else {
+    logger.log(
+      `Auth: Google Identity — expected client id (aud): ${auth.googleOAuthClientId || '(UNSET!)'}`,
+    );
+    logger.log(
+      `Auth domain allow-list: ${auth.allowedAuthDomains.join(', ') || '(open sign-up — any verified Google account)'}`,
+    );
+  }
 }
 
 void bootstrap();

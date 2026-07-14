@@ -1,6 +1,6 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
-import { AuthenticatedUser } from '../common/interfaces/authenticated-user.interface';
-import { TokenVerifier } from './token-verifier';
+import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-principal.interface';
+import { AuthService } from './auth.service';
 
 /** Minimal shape of a Socket.IO client handshake we read a token from. */
 export interface WsHandshakeSocket {
@@ -13,28 +13,23 @@ export interface WsHandshakeSocket {
 
 /**
  * Authenticates a WebSocket connection from its handshake, reusing the same
- * Firebase-backed TokenVerifier as the HTTP guard. Kept separate from the
- * gateway so it can be unit-tested and shared by the signaling and audio
- * gateways (security-use-guards, di-use-interfaces-tokens).
+ * AuthService (and therefore the same Google token verification and account
+ * policy) as the HTTP guard. Kept separate from the gateway so it can be
+ * unit-tested and shared by the signaling and audio gateways
+ * (security-use-guards, di-use-interfaces-tokens).
  */
 @Injectable()
 export class WsAuthenticator {
-  constructor(private readonly tokenVerifier: TokenVerifier) {}
+  constructor(private readonly authService: AuthService) {}
 
-  async authenticate(client: WsHandshakeSocket): Promise<AuthenticatedUser> {
+  async authenticate(
+    client: WsHandshakeSocket,
+  ): Promise<AuthenticatedPrincipal> {
     const token = this.extractToken(client);
     if (!token) {
       throw new UnauthorizedException('Missing socket auth token');
     }
-
-    const decoded = await this.tokenVerifier.verify(token);
-    return {
-      uid: decoded.uid,
-      email: decoded.email,
-      emailVerified: decoded.emailVerified,
-      name: decoded.name,
-      picture: decoded.picture,
-    };
+    return this.authService.authenticate(token);
   }
 
   private extractToken(client: WsHandshakeSocket): string | null {

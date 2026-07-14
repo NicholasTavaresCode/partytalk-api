@@ -1,57 +1,57 @@
-import { TokenVerifier, VerifiedToken } from './token-verifier';
+import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-principal.interface';
+import { AuthService } from './auth.service';
 import { WsAuthenticator, WsHandshakeSocket } from './ws-authenticator';
 
 describe('WsAuthenticator', () => {
-  let verifier: jest.Mocked<TokenVerifier>;
+  let authService: { authenticate: jest.Mock };
   let auth: WsAuthenticator;
+
+  const principal: AuthenticatedPrincipal = {
+    uid: 'u1',
+    email: 'a@b.com',
+    emailVerified: true,
+    status: 'active',
+  };
 
   const socketWith = (
     handshake: WsHandshakeSocket['handshake'],
   ): WsHandshakeSocket => ({ handshake });
 
   beforeEach(() => {
-    verifier = { verify: jest.fn() };
-    auth = new WsAuthenticator(verifier);
+    authService = { authenticate: jest.fn() };
+    auth = new WsAuthenticator(authService as unknown as AuthService);
   });
 
   it('authenticates from handshake.auth.token', async () => {
-    const decoded: VerifiedToken = { uid: 'u1', email: 'a@b.com' };
-    verifier.verify.mockResolvedValue(decoded);
+    authService.authenticate.mockResolvedValue(principal);
 
     const user = await auth.authenticate(
       socketWith({ auth: { token: 'good' }, headers: {} }),
     );
 
-    expect(verifier.verify).toHaveBeenCalledWith('good');
-    expect(user).toEqual({
-      uid: 'u1',
-      email: 'a@b.com',
-      emailVerified: undefined,
-      name: undefined,
-      picture: undefined,
-    });
+    expect(authService.authenticate).toHaveBeenCalledWith('good');
+    expect(user).toBe(principal);
   });
 
   it('falls back to the Authorization bearer header', async () => {
-    verifier.verify.mockResolvedValue({ uid: 'u2' });
+    authService.authenticate.mockResolvedValue(principal);
 
-    const user = await auth.authenticate(
+    await auth.authenticate(
       socketWith({ auth: {}, headers: { authorization: 'Bearer hdr' } }),
     );
 
-    expect(verifier.verify).toHaveBeenCalledWith('hdr');
-    expect(user.uid).toBe('u2');
+    expect(authService.authenticate).toHaveBeenCalledWith('hdr');
   });
 
   it('throws when no token is present', async () => {
     await expect(
       auth.authenticate(socketWith({ auth: {}, headers: {} })),
     ).rejects.toThrow();
-    expect(verifier.verify).not.toHaveBeenCalled();
+    expect(authService.authenticate).not.toHaveBeenCalled();
   });
 
-  it('throws when the verifier rejects the token', async () => {
-    verifier.verify.mockRejectedValue(new Error('expired'));
+  it('throws when AuthService rejects the token', async () => {
+    authService.authenticate.mockRejectedValue(new Error('expired'));
     await expect(
       auth.authenticate(socketWith({ auth: { token: 'bad' }, headers: {} })),
     ).rejects.toThrow();

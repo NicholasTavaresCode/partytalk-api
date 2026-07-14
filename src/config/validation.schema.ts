@@ -15,6 +15,14 @@ export const validationSchema = Joi.object({
   GOOGLE_APPLICATION_CREDENTIALS: Joi.string().allow('').optional(),
   FIRESTORE_EMULATOR_HOST: Joi.string().allow('').optional(),
 
+  // Google Identity ("Sign in with Google") — the frontend does the sign-in and
+  // sends the resulting ID token; the API verifies it against this client id.
+  GOOGLE_OAUTH_CLIENT_ID: Joi.string().required(),
+  // Optional comma-separated Workspace domain allow-list. Empty = open sign-up.
+  ALLOWED_AUTH_DOMAINS: Joi.string().allow('').optional(),
+  // TEMP local-testing flag: true bypasses Google token verification entirely.
+  AUTH_DISABLED: Joi.boolean().default(false),
+
   VERTEX_LOCATION: Joi.string().default('us-central1'),
   VERTEX_HOST_MODEL: Joi.string().default('gemini-2.0-flash'),
   VERTEX_SCORING_MODEL: Joi.string().default('gemini-2.0-flash'),

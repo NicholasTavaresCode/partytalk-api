@@ -5,7 +5,10 @@ import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { AllExceptionsFilter } from '../src/common/filters/all-exceptions.filter';
 import { HttpAdapterHost } from '@nestjs/core';
-import { TokenVerifier, VerifiedToken } from '../src/auth/token-verifier';
+import {
+  IdTokenVerifier,
+  VerifiedIdentity,
+} from '../src/auth/id-token-verifier';
 import { FIRESTORE } from '../src/firestore/firestore.constants';
 import { User } from '../src/users/entities/user.entity';
 import { UsersRepository } from '../src/users/users.repository';
@@ -32,11 +35,15 @@ class InMemoryUsersRepository extends UsersRepository {
   }
 }
 
-/** Verifier that trusts the bearer token as the uid — lets tests pick an identity. */
-class FakeTokenVerifier extends TokenVerifier {
-  async verify(idToken: string): Promise<VerifiedToken> {
+/** Verifier that trusts the bearer token as the Google `sub` — lets tests pick an identity. */
+class FakeIdTokenVerifier extends IdTokenVerifier {
+  async verify(idToken: string): Promise<VerifiedIdentity> {
     if (idToken === 'invalid') throw new Error('bad token');
-    return { uid: idToken, email: `${idToken}@example.com`, emailVerified: true };
+    return {
+      sub: idToken,
+      email: `${idToken}@example.com`,
+      emailVerified: true,
+    };
   }
 }
 
@@ -49,8 +56,8 @@ describe('Users (e2e)', () => {
     })
       .overrideProvider(FIRESTORE)
       .useValue({ listCollections: async () => [] })
-      .overrideProvider(TokenVerifier)
-      .useClass(FakeTokenVerifier)
+      .overrideProvider(IdTokenVerifier)
+      .useClass(FakeIdTokenVerifier)
       .overrideProvider(UsersRepository)
       .useClass(InMemoryUsersRepository)
       .compile();
@@ -87,18 +94,42 @@ describe('Users (e2e)', () => {
       .expect(401);
   });
 
-  it('404s when the profile does not exist yet', () => {
+  it('auto-provisions the caller on first authenticated request', () => {
+    // JIT provisioning happens in the guard, so GET /users/me returns the freshly
+    // created record (active) even before the profile is filled in.
     return request(app.getHttpServer())
       .get('/api/v1/users/me')
-      .set('Authorization', 'Bearer alice')
-      .expect(404);
+      .set('Authorization', 'Bearer carol')
+      .expect(200)
+      .expect((res) => {
+        expect(res.body.data.id).toBe('carol');
+        expect(res.body.data.email).toBe('carol@example.com');
+        expect(res.body.data.status).toBe('active');
+        expect(res.body.data.displayName).toBeUndefined();
+      });
+  });
+
+  it('GET /api/v1/auth/me echoes the resolved principal', () => {
+    return request(app.getHttpServer())
+      .get('/api/v1/auth/me')
+      .set('Authorization', 'Bearer dave')
+      .expect(200)
+      .expect((res) => {
+        expect(res.body.data.uid).toBe('dave');
+        expect(res.body.data.email).toBe('dave@example.com');
+        expect(res.body.data.status).toBe('active');
+      });
   });
 
   it('creates then reads the caller profile (upsert)', async () => {
     await request(app.getHttpServer())
       .put('/api/v1/users/me')
       .set('Authorization', 'Bearer alice')
-      .send({ displayName: 'Alice', englishLevel: 'intermediate', targetIeltsBand: 7 })
+      .send({
+        displayName: 'Alice',
+        englishLevel: 'intermediate',
+        targetIeltsBand: 7,
+      })
       .expect(200)
       .expect((res) => {
         expect(res.body.data.id).toBe('alice');

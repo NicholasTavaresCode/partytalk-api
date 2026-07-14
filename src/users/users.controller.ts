@@ -15,7 +15,7 @@ import {
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { AuthenticatedUser } from '../common/interfaces/authenticated-user.interface';
+import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-principal.interface';
 import { ApiEnvelopeResponse } from '../common/swagger/api-envelope';
 import { ErrorResponseDto } from '../common/swagger/error-response.dto';
 import { UpsertProfileDto } from './dto/upsert-profile.dto';
@@ -28,9 +28,9 @@ import { UsersService } from './users.service';
  * another user's record (no IDOR surface).
  */
 @ApiTags('Users')
-@ApiBearerAuth('firebase')
+@ApiBearerAuth('google')
 @ApiUnauthorizedResponse({
-  description: 'Missing, malformed, or expired Firebase token.',
+  description: 'Missing, malformed, or invalid Google ID token.',
   type: ErrorResponseDto,
 })
 @Controller({ path: 'users', version: '1' })
@@ -41,10 +41,10 @@ export class UsersController {
   @ApiOperation({
     summary: 'Get my profile',
     description:
-      'Returns the authenticated user’s profile. Returns 404 until the profile has been created via `PUT /users/me`.',
+      'Returns the authenticated user’s profile. The record is auto-provisioned on first sign-in, so this succeeds immediately; the learner fields (`displayName`, `englishLevel`, `targetIeltsBand`) stay empty until set via `PUT /users/me`.',
   })
   @ApiEnvelopeResponse(User, { description: 'The caller’s profile.' })
-  getMe(@CurrentUser() user: AuthenticatedUser): Promise<User> {
+  getMe(@CurrentUser() user: AuthenticatedPrincipal): Promise<User> {
     return this.usersService.getProfile(user.uid);
   }
 
@@ -52,11 +52,11 @@ export class UsersController {
   @ApiOperation({
     summary: 'Create or update my profile',
     description:
-      'Idempotent upsert of the caller’s profile keyed by their Firebase UID. The first call after sign-in materializes the profile; later calls update it (preserving `createdAt`).',
+      'Idempotent upsert of the caller’s profile keyed by their Google account `sub`. The profile is auto-provisioned on first sign-in; this fills in and updates the learner fields (preserving `createdAt`).',
   })
   @ApiEnvelopeResponse(User, { description: 'The saved profile.' })
   upsertMe(
-    @CurrentUser() user: AuthenticatedUser,
+    @CurrentUser() user: AuthenticatedPrincipal,
     @Body() dto: UpsertProfileDto,
   ): Promise<User> {
     return this.usersService.upsertProfile(user, dto);

@@ -12,6 +12,21 @@ export interface AppConfig {
     credentialsPath?: string;
     firestoreEmulatorHost?: string;
   };
+  auth: {
+    /** OAuth 2.0 client id the frontend signs in with; the expected `aud` of every ID token. */
+    googleOAuthClientId: string;
+    /**
+     * Optional Google Workspace domain allow-list. Empty = any verified Google
+     * account may sign in. When set, an email outside these domains is rejected.
+     */
+    allowedAuthDomains: string[];
+    /**
+     * TEMPORARY local-testing escape hatch. When true, the guard skips Google
+     * token verification entirely and treats every request as a fixed dev user.
+     * Must be false anywhere shared or deployed.
+     */
+    disabled: boolean;
+  };
   vertex: {
     location: string;
     hostModel: string;
@@ -38,6 +53,14 @@ export default (): AppConfig => ({
     projectId: process.env.GCP_PROJECT_ID ?? '',
     credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS || undefined,
     firestoreEmulatorHost: process.env.FIRESTORE_EMULATOR_HOST || undefined,
+  },
+  auth: {
+    googleOAuthClientId: process.env.GOOGLE_OAUTH_CLIENT_ID ?? '',
+    allowedAuthDomains: (process.env.ALLOWED_AUTH_DOMAINS ?? '')
+      .split(',')
+      .map((domain) => domain.trim().toLowerCase())
+      .filter(Boolean),
+    disabled: process.env.AUTH_DISABLED === 'true',
   },
   vertex: {
     location: process.env.VERTEX_LOCATION ?? 'us-central1',

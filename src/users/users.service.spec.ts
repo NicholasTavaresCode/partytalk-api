@@ -1,6 +1,6 @@
 import { NotFoundException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { AuthenticatedUser } from '../common/interfaces/authenticated-user.interface';
+import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-principal.interface';
 import { User } from './entities/user.entity';
 import { UsersRepository } from './users.repository';
 import { UsersService } from './users.service';
@@ -34,9 +34,10 @@ describe('UsersService', () => {
   let service: UsersService;
   let repo: InMemoryUsersRepository;
 
-  const authUser: AuthenticatedUser = {
+  const authUser: AuthenticatedPrincipal = {
     uid: 'uid-1',
     email: 'learner@example.com',
+    status: 'active',
   };
 
   beforeEach(async () => {
@@ -110,7 +111,7 @@ describe('UsersService', () => {
 
     it('falls back to a placeholder email when the token has none', async () => {
       const result = await service.upsertProfile(
-        { uid: 'uid-2' },
+        { uid: 'uid-2', status: 'active' },
         { displayName: 'Anon', englishLevel: 'elementary' },
       );
       expect(result.email).toBe('');

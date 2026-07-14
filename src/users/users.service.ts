@@ -1,14 +1,16 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { AuthenticatedUser } from '../common/interfaces/authenticated-user.interface';
+import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-principal.interface';
 import { UpsertProfileDto } from './dto/upsert-profile.dto';
 import { User } from './entities/user.entity';
 import { UsersRepository } from './users.repository';
 
 /**
- * Owns user-profile business rules. A user's id is always their Firebase UID,
- * so there is no separate "create account" flow — the first upsert after
- * sign-in materializes the profile. Focused single-responsibility service
- * (arch-single-responsibility).
+ * Owns user-profile business rules. A user's id is always their Google `sub`.
+ * The account record is JIT-provisioned by AuthService on first login; this
+ * service fills in and updates the learner-profile fields on top of it. The
+ * create branch below is a defensive fallback for the (normally impossible)
+ * case of an upsert arriving before provisioning. Focused single-responsibility
+ * service (arch-single-responsibility).
  */
 @Injectable()
 export class UsersService {
@@ -23,7 +25,7 @@ export class UsersService {
   }
 
   async upsertProfile(
-    authUser: AuthenticatedUser,
+    authUser: AuthenticatedPrincipal,
     dto: UpsertProfileDto,
   ): Promise<User> {
     const existing = await this.usersRepository.findById(authUser.uid);
@@ -33,6 +35,7 @@ export class UsersService {
       return this.usersRepository.create({
         id: authUser.uid,
         email: authUser.email ?? '',
+        status: authUser.status,
         displayName: dto.displayName,
         englishLevel: dto.englishLevel,
         targetIeltsBand: dto.targetIeltsBand,

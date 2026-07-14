@@ -5,8 +5,8 @@ import { User } from './entities/user.entity';
 import { UsersRepository } from './users.repository';
 
 /**
- * Firestore-backed UsersRepository. The document id is the user's Firebase UID,
- * so lookups are single-document reads (no queries, no N+1). All SDK access is
+ * Firestore-backed UsersRepository. The document id is the user's Google account
+ * `sub`, so lookups are single-document reads (no queries, no N+1). All SDK access is
  * confined here; the service stays persistence-agnostic.
  */
 @Injectable()

@@ -32,7 +32,8 @@ export class Room {
   topic!: string;
 
   @ApiProperty({
-    description: 'Persona/brief that shapes the AI facilitator’s tone and nudges.',
+    description:
+      'Persona/brief that shapes the AI facilitator’s tone and nudges.',
     example: 'A warm, curious facilitator who loves unexpected tangents',
     maxLength: 300,
   })
@@ -47,15 +48,17 @@ export class Room {
   status!: RoomStatus;
 
   @ApiProperty({
-    description: 'Firebase UID of the creator/owner (always a participant).',
-    example: 'aXbQ1m9Zt0Yc3kLpR7sVwE2fH1',
+    description:
+      'Google account `sub` of the creator/owner (always a participant).',
+    example: '110169484474386276334',
   })
   ownerId!: string;
 
   @ApiProperty({
     type: [String],
-    description: 'Firebase UIDs currently in the room (includes the owner).',
-    example: ['aXbQ1m9Zt0Yc3kLpR7sVwE2fH1', 'kM4nP2qR8sT0uV6wX1yZ3aB5cD7'],
+    description:
+      'Google account `sub`s currently in the room (includes the owner).',
+    example: ['110169484474386276334', '104638912223344556677'],
   })
   participantIds!: string[];
 
