@@ -20,8 +20,14 @@ async function bootstrap(): Promise<void> {
 
   // Security headers (security-sanitize-output) + tight CORS.
   app.use(helmet());
+  // A literal "*" cannot be combined with credentials — the browser needs the
+  // caller's specific origin echoed back. So when CORS_ORIGINS is "*" we use
+  // `origin: true`, which reflects the request origin (and allows credentials);
+  // otherwise we allow only the configured origins.
+  const corsOrigins = config.get('corsOrigins', { infer: true });
+  const allowAnyOrigin = corsOrigins.includes('*');
   app.enableCors({
-    origin: config.get('corsOrigins', { infer: true }),
+    origin: allowAnyOrigin ? true : corsOrigins,
     credentials: true,
   });
 
@@ -42,13 +48,16 @@ async function bootstrap(): Promise<void> {
   // so misconfig (wrong client id, missing origin) is caught without guessing.
   const logger = app.get(Logger);
   const env = config.get('env', { infer: true });
-  const corsOrigins = config.get('corsOrigins', { infer: true });
   const auth = config.get('auth', { infer: true });
 
   logger.log(
     `PartyTalk API listening on http://localhost:${port}/api/v1 [${env}]`,
   );
-  logger.log(`CORS allowed origins: ${corsOrigins.join(', ') || '(none)'}`);
+  logger.log(
+    `CORS allowed origins: ${
+      allowAnyOrigin ? '(any origin — reflected)' : corsOrigins.join(', ') || '(none)'
+    }`,
+  );
   if (auth.disabled) {
     logger.warn(
       'AUTH DISABLED (AUTH_DISABLED=true) — every request is treated as a dev user. Do not deploy like this.',

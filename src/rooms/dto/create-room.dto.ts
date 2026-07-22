@@ -40,15 +40,15 @@ export class CreateRoomDto {
 
   @ApiPropertyOptional({
     description:
-      'Maximum number of participants (2–5). Capped at 5 while voice runs over P2P mesh WebRTC; see docs/audio-architecture.md. Defaults to 5.',
+      'Maximum number of participants (1–5). Use 1 for a solo test room. Capped at 5 while voice runs over P2P mesh WebRTC; see docs/audio-architecture.md. Defaults to 5.',
     example: 5,
-    minimum: 2,
+    minimum: 1,
     maximum: 5,
     default: 5,
   })
   @IsOptional()
   @IsInt()
-  @Min(2)
+  @Min(1)
   @Max(5)
   maxParticipants?: number;
 }

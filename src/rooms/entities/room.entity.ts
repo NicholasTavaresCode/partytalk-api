@@ -63,10 +63,10 @@ export class Room {
   participantIds!: string[];
 
   @ApiProperty({
-    minimum: 2,
+    minimum: 1,
     maximum: 5,
     description:
-      'Maximum number of participants allowed (capped at 5 while on P2P mesh audio).',
+      'Maximum number of participants allowed (1 for a solo test room; capped at 5 while on P2P mesh audio).',
     example: 5,
   })
   maxParticipants!: number;
