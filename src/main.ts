@@ -55,7 +55,9 @@ async function bootstrap(): Promise<void> {
   );
   logger.log(
     `CORS allowed origins: ${
-      allowAnyOrigin ? '(any origin — reflected)' : corsOrigins.join(', ') || '(none)'
+      allowAnyOrigin
+        ? '(any origin — reflected)'
+        : corsOrigins.join(', ') || '(none)'
     }`,
   );
   if (auth.disabled) {

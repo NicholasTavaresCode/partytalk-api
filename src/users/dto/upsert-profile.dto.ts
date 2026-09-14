@@ -1,14 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import {
-  IsIn,
-  IsNumber,
-  IsOptional,
-  IsString,
-  Max,
-  MaxLength,
-  Min,
-  MinLength,
-} from 'class-validator';
+import { IsIn, IsString, MaxLength, MinLength } from 'class-validator';
 import { EnglishLevel, ENGLISH_LEVELS } from '../entities/user.entity';
 
 /**
@@ -35,17 +26,4 @@ export class UpsertProfileDto {
   })
   @IsIn(ENGLISH_LEVELS)
   englishLevel!: EnglishLevel;
-
-  @ApiProperty({
-    required: false,
-    minimum: 1,
-    maximum: 9,
-    description: 'Target overall IELTS band (0.5 increments), 1–9.',
-    example: 7.5,
-  })
-  @IsOptional()
-  @IsNumber()
-  @Min(1)
-  @Max(9)
-  targetIeltsBand?: number;
 }

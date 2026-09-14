@@ -15,6 +15,7 @@ import {
   ApiNotFoundResponse,
   ApiOperation,
   ApiParam,
+  ApiServiceUnavailableResponse,
   ApiTags,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
@@ -25,8 +26,8 @@ import { ApiEnvelopeResponse } from '../common/swagger/api-envelope';
 import { ErrorResponseDto } from '../common/swagger/error-response.dto';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { PostTranscriptDto } from './dto/post-transcript.dto';
+import { HostMessage } from './entities/host-message.entity';
 import { Room } from './entities/room.entity';
-import { TopicSuggestion } from './entities/topic-suggestion.entity';
 import { TranscriptSegment } from './entities/transcript-segment.entity';
 import { RoomsGateway } from './rooms.gateway';
 import { RoomsService } from './rooms.service';
@@ -42,7 +43,7 @@ const ROOM_ID_PARAM = {
  * so the caller's uid always comes from the verified token (never the body) —
  * ownership/participation checks live in the service. Realtime voice flows over
  * the Socket.IO `rooms` namespace; these endpoints own persistence, the manual
- * facilitator trigger, and reads.
+ * topic change, and reads.
  */
 @ApiTags('Rooms')
 @ApiBearerAuth('google')
@@ -61,11 +62,16 @@ export class RoomsController {
   @ApiOperation({
     summary: 'Create a room',
     description:
-      'Opens a new practice room owned by the caller. The room starts in `waiting` status with the owner as its sole participant. `facilitatorPersona` and `maxParticipants` default when omitted. The AI facilitator stays silent until people begin talking.',
+      'Opens a new practice room owned by the caller. The room starts in `waiting` status with the owner as its sole participant. `maxParticipants` (default 5) and `durationMinutes` (10, 15, 30, 45 or 60; default 30) may be omitted. Set `hostPicksTopic: true` to let the AI host choose the opening topic — `topic` is then optional and ignored, and the call fails with 503 if the AI is unavailable. Once open, the host stays quiet until people begin talking.',
   })
   @ApiEnvelopeResponse(Room, {
     created: true,
     description: 'The created room.',
+  })
+  @ApiServiceUnavailableResponse({
+    type: ErrorResponseDto,
+    description:
+      'The AI host could not pick an opening topic (only when `hostPicksTopic` is true).',
   })
   create(
     @CurrentUser('uid') uid: string,
@@ -108,7 +114,7 @@ export class RoomsController {
   @ApiOperation({
     summary: 'Join a room',
     description:
-      'Adds the caller to the room’s participants. Idempotent — already-joined callers get the room unchanged. Fails with 409 if the room has ended or is at `maxParticipants`, and 404 if it does not exist.',
+      'Adds the caller to the room’s participants and pushes the updated room to everyone already in it as a `roomUpdated` socket event. Idempotent — already-joined callers get the room unchanged. Fails with 409 if the room has ended or is at `maxParticipants`, and 404 if it does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, { description: 'The room including the caller.' })
@@ -120,18 +126,20 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room is full or already ended.',
   })
-  join(
+  async join(
     @Param('id') id: string,
     @CurrentUser('uid') uid: string,
   ): Promise<Room> {
-    return this.roomsService.joinRoom(id, uid);
+    const room = await this.roomsService.joinRoom(id, uid);
+    this.roomsGateway.broadcastRoomUpdated(room);
+    return room;
   }
 
   @Post(':id/leave')
   @ApiOperation({
     summary: 'Leave a room',
     description:
-      'Removes the caller from the room’s participants. Idempotent. The room is not deleted even if it becomes empty. Returns 404 if the room does not exist.',
+      'Removes the caller from the room’s participants and pushes the updated room to everyone still in it as a `roomUpdated` socket event. Idempotent. The room is not deleted even if it becomes empty. Returns 404 if the room does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, { description: 'The room without the caller.' })
@@ -139,18 +147,20 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
-  leave(
+  async leave(
     @Param('id') id: string,
     @CurrentUser('uid') uid: string,
   ): Promise<Room> {
-    return this.roomsService.leaveRoom(id, uid);
+    const room = await this.roomsService.leaveRoom(id, uid);
+    this.roomsGateway.broadcastRoomUpdated(room);
+    return room;
   }
 
   @Post(':id/start')
   @ApiOperation({
     summary: 'Start a room',
     description:
-      'Transitions the room to `live` so transcript ingestion and facilitator nudges begin. No AI turn is produced yet — the facilitator only reacts once people talk. Owner-only (non-owners get 403). Returns 404 if the room does not exist.',
+      'Transitions a `waiting` room to `live`, stamps `startedAt` and `scheduledEndAt` (= start + `durationMinutes`) and starts the clock: the session ends automatically at `scheduledEndAt` — report generated, `sessionEnded` emitted — unless the owner ends it first. Everyone in the room receives the now-live room (with `scheduledEndAt`) as a `roomUpdated` socket event. The host says nothing yet; it only steps in once people have talked. Owner-only (non-owners get 403). Returns 409 if the room has already started or has ended, and 404 if it does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, { description: 'The now-live room.' })
@@ -162,18 +172,25 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Only the room owner may start/end the room.',
   })
-  start(
+  @ApiConflictResponse({
+    type: ErrorResponseDto,
+    description: 'Room has already started or has ended.',
+  })
+  async start(
     @Param('id') id: string,
     @CurrentUser('uid') uid: string,
   ): Promise<Room> {
-    return this.roomsService.startRoom(id, uid);
+    const room = await this.roomsService.startRoom(id, uid);
+    this.roomsGateway.scheduleSessionEnd(room);
+    this.roomsGateway.broadcastRoomUpdated(room);
+    return room;
   }
 
   @Post(':id/end')
   @ApiOperation({
     summary: 'End a room (and generate its report)',
     description:
-      'Transitions the room to `ended`, stamps `endedAt`, and generates the single room-level report (highlights + suggestions) from the full transcript — returned on the room’s `report` field and pushed to participants as a `sessionEnded` socket event. Report generation is best-effort: if the AI is unavailable the room still ends, without a report. Owner-only (non-owners get 403). Returns 404 if the room does not exist.',
+      'Ends the session now instead of waiting for `scheduledEndAt`: transitions the room to `ended`, stamps `endedAt`, and generates the single room-level report (summary, highlights, suggestions, topics explored) from the full conversation including the host’s topic changes — returned on the room’s `report` field and pushed to participants as a `sessionEnded` socket event. Report generation is best-effort: if the AI is unavailable the room still ends, without a report. Owner-only (non-owners get 403). Returns 404 if the room does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, {
@@ -223,7 +240,7 @@ export class RoomsController {
   @ApiOperation({
     summary: 'Add a transcript segment',
     description:
-      'Persists one transcript segment spoken by the caller — a REST alternative to the realtime `transcript` socket event, useful for testing and non-socket clients. Does not itself trigger a suggestion (auto-triggers run in the gateway). Returns 404 if the room does not exist.',
+      'Persists one transcript segment spoken by the caller — a REST alternative to the realtime `transcript` socket event, useful for testing and non-socket clients. Does not itself consult the host (auto-triggers run in the gateway). Returns 404 if the room does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(TranscriptSegment, {
@@ -246,45 +263,47 @@ export class RoomsController {
     );
   }
 
-  @Post(':id/suggest-topic')
+  @Post(':id/change-topic')
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({
-    summary: 'Suggest a topic now (manual trigger)',
+    summary: 'Make the host change the topic now (manual override)',
     description:
-      'Forces the AI facilitator to read the recent transcript and produce one new, related topic immediately — the same engine the automatic volume/silence triggers use. Returns 404 if the room does not exist.',
+      'Forces the AI host to step in immediately: it listens to the recent conversation and says a line that moves the room onto a completely different topic — for when the group wants a fresh subject or did not like the current one. Unlike the automatic in-session checks (where the host only speaks when it judges the current topic has been talked about enough or the room has gone quiet), this always produces a host message. The message is stored, pushed to participants as a `hostMessage` socket event, and returned. Returns 404 if the room does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
-  @ApiEnvelopeResponse(TopicSuggestion, {
+  @ApiEnvelopeResponse(HostMessage, {
     created: true,
-    description: 'The generated topic suggestion.',
+    description: 'What the host said.',
   })
   @ApiNotFoundResponse({
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
-  suggestTopic(@Param('id') id: string): Promise<TopicSuggestion> {
-    return this.roomsService.generateTopicSuggestion(id, 'manual');
+  async changeTopic(@Param('id') id: string): Promise<HostMessage> {
+    const message = await this.roomsService.forceTopicChange(id);
+    this.roomsGateway.broadcastHostMessage(message);
+    return message;
   }
 
-  @Get(':id/suggestions')
+  @Get(':id/host-messages')
   @ApiOperation({
-    summary: 'List topic suggestions',
+    summary: 'List what the host has said',
     description:
-      'Returns the AI facilitator’s topic suggestions for the room, oldest first. Returns 404 if the room does not exist.',
+      'Returns the AI host’s lines in this room — every topic change it announced — oldest first. Returns 404 if the room does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
-  @ApiEnvelopeResponse(TopicSuggestion, {
+  @ApiEnvelopeResponse(HostMessage, {
     isArray: true,
-    description: 'Topic suggestions, oldest first.',
+    description: 'Host messages, oldest first.',
   })
   @ApiNotFoundResponse({
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
-  getSuggestions(
+  getHostMessages(
     @Param('id') id: string,
     @Query() query: PaginationQueryDto,
-  ): Promise<TopicSuggestion[]> {
-    return this.roomsService.listSuggestions(id, query.limit);
+  ): Promise<HostMessage[]> {
+    return this.roomsService.listHostMessages(id, query.limit);
   }
 }

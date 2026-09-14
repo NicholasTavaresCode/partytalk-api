@@ -40,7 +40,12 @@ export class RoomReport {
   @ApiProperty({
     type: [String],
     description: 'Distinct topics the conversation actually explored.',
-    example: ['weekend plans', 'coastal travel', 'street food', 'personal goals'],
+    example: [
+      'weekend plans',
+      'coastal travel',
+      'street food',
+      'personal goals',
+    ],
   })
   topicsExplored!: string[];
 

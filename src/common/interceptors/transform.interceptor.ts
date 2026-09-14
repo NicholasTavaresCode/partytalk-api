@@ -19,9 +19,10 @@ export interface ApiResponse<T> {
  * Errors bypass this and are shaped by AllExceptionsFilter instead.
  */
 @Injectable()
-export class TransformInterceptor<T>
-  implements NestInterceptor<T, ApiResponse<T>>
-{
+export class TransformInterceptor<T> implements NestInterceptor<
+  T,
+  ApiResponse<T>
+> {
   intercept(
     _context: ExecutionContext,
     next: CallHandler<T>,

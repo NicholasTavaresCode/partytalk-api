@@ -1,8 +1,8 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Firestore } from 'firebase-admin/firestore';
 import { COLLECTIONS, FIRESTORE } from '../firestore/firestore.constants';
+import { HostMessage } from './entities/host-message.entity';
 import { Room, RoomStatus } from './entities/room.entity';
-import { TopicSuggestion } from './entities/topic-suggestion.entity';
 import { TranscriptSegment } from './entities/transcript-segment.entity';
 import { RoomsRepository } from './rooms.repository';
 
@@ -10,10 +10,10 @@ const OPEN_STATUSES: RoomStatus[] = ['waiting', 'live'];
 
 /**
  * Firestore-backed RoomsRepository. The document id is the room's id, so
- * lookups are single-document reads. Transcript segments and topic suggestions
- * live in per-room subcollections (`rooms/{id}/segments`, `rooms/{id}/suggestions`)
- * so reads never scan other rooms. All SDK access is confined here; the service
- * stays persistence-agnostic.
+ * lookups are single-document reads. Transcript segments and the host's lines
+ * live in per-room subcollections (`rooms/{id}/segments`,
+ * `rooms/{id}/hostMessages`) so reads never scan other rooms. All SDK access is
+ * confined here; the service stays persistence-agnostic.
  */
 @Injectable()
 export class FirestoreRoomsRepository extends RoomsRepository {
@@ -29,8 +29,10 @@ export class FirestoreRoomsRepository extends RoomsRepository {
     return this.collection.doc(roomId).collection(COLLECTIONS.ROOM_SEGMENTS);
   }
 
-  private suggestionsCollection(roomId: string) {
-    return this.collection.doc(roomId).collection(COLLECTIONS.ROOM_SUGGESTIONS);
+  private hostMessagesCollection(roomId: string) {
+    return this.collection
+      .doc(roomId)
+      .collection(COLLECTIONS.ROOM_HOST_MESSAGES);
   }
 
   async findById(id: string): Promise<Room | null> {
@@ -86,26 +88,35 @@ export class FirestoreRoomsRepository extends RoomsRepository {
     return snapshot.docs.map((doc) => doc.data() as TranscriptSegment);
   }
 
-  async countSegments(roomId: string): Promise<number> {
-    const snapshot = await this.segmentsCollection(roomId).count().get();
-    return snapshot.data().count;
-  }
-
-  async addSuggestion(suggestion: TopicSuggestion): Promise<TopicSuggestion> {
-    await this.suggestionsCollection(suggestion.roomId)
-      .doc(suggestion.id)
-      .set(suggestion);
-    return suggestion;
-  }
-
-  async listSuggestions(
+  async listRecentSegments(
     roomId: string,
     limit: number,
-  ): Promise<TopicSuggestion[]> {
-    const snapshot = await this.suggestionsCollection(roomId)
+  ): Promise<TranscriptSegment[]> {
+    // Newest first to take the tail, then flip back to chronological order.
+    const snapshot = await this.segmentsCollection(roomId)
+      .orderBy('at', 'desc')
+      .limit(limit)
+      .get();
+    return snapshot.docs
+      .map((doc) => doc.data() as TranscriptSegment)
+      .reverse();
+  }
+
+  async addHostMessage(message: HostMessage): Promise<HostMessage> {
+    await this.hostMessagesCollection(message.roomId)
+      .doc(message.id)
+      .set(message);
+    return message;
+  }
+
+  async listHostMessages(
+    roomId: string,
+    limit: number,
+  ): Promise<HostMessage[]> {
+    const snapshot = await this.hostMessagesCollection(roomId)
       .orderBy('at')
       .limit(limit)
       .get();
-    return snapshot.docs.map((doc) => doc.data() as TopicSuggestion);
+    return snapshot.docs.map((doc) => doc.data() as HostMessage);
   }
 }

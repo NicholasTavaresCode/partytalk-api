@@ -41,7 +41,7 @@ export class UsersController {
   @ApiOperation({
     summary: 'Get my profile',
     description:
-      'Returns the authenticated user’s profile. The record is auto-provisioned on first sign-in, so this succeeds immediately; the learner fields (`displayName`, `englishLevel`, `targetIeltsBand`) stay empty until set via `PUT /users/me`.',
+      'Returns the authenticated user’s profile. The record is auto-provisioned on first sign-in, so this succeeds immediately; the learner fields (`displayName`, `englishLevel`) stay empty until set via `PUT /users/me`.',
   })
   @ApiEnvelopeResponse(User, { description: 'The caller’s profile.' })
   getMe(@CurrentUser() user: AuthenticatedPrincipal): Promise<User> {

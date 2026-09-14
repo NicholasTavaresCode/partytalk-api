@@ -1,7 +1,7 @@
 {
   "name": "partytalk-api",
   "version": "0.1.0",
-  "description": "PartyTalk API — live group English practice rooms with an AI host, plus a solo IELTS exam simulator.",
+  "description": "PartyTalk API — live group English-practice rooms with an AI host that keeps moving the conversation onto new topics.",
   "author": "",
   "private": true,
   "license": "UNLICENSED",

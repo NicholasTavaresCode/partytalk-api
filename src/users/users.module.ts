@@ -6,7 +6,7 @@ import { UsersService } from './users.service';
 
 /**
  * Feature module for user profiles (arch-feature-modules). Exports UsersService
- * (and the repository token) so other features — e.g. Rooms/IELTS — can resolve
+ * (and the repository token) so other features — e.g. Rooms — can resolve
  * user data without reaching into Firestore themselves.
  */
 @Module({

@@ -82,13 +82,11 @@ describe('UsersService', () => {
       const result = await service.upsertProfile(authUser, {
         displayName: 'Ada',
         englishLevel: 'advanced',
-        targetIeltsBand: 7.5,
       });
 
       expect(result.id).toBe('uid-1');
       expect(result.email).toBe('learner@example.com');
       expect(result.displayName).toBe('Ada');
-      expect(result.targetIeltsBand).toBe(7.5);
       expect(result.createdAt).toEqual(result.updatedAt);
       expect(await repo.findById('uid-1')).not.toBeNull();
     });

@@ -3,7 +3,7 @@
 **Status:** proposed · **Date:** 2026-07-07 · **Owner:** backend
 
 This document designs the subsystem that lets people hold a **real-time group
-voice call** while the **AI listens to the live audio server-side** and suggests
+voice call** while the **AI listens to the live audio server-side** and steps in with
 new topics *during* the call. It is a design to review **before** implementation.
 
 ---
@@ -18,7 +18,7 @@ from three places:
 | **Human↔human media** | **P2P mesh WebRTC** (no media server) | Browsers send audio directly to each other. Our server only relays tiny signaling messages. No SFU, no egress, no per-minute media bill. |
 | **Getting audio to the AI** | **Client mic → WebSocket → backend** | Reuses a plain WebSocket; no media server needed just for the AI to hear. |
 | **AI "listening" (STT)** | **Google Cloud Speech-to-Text**, chunked + gated by VAD | STT is the one unavoidable cost. We minimise minutes billed (see §7). |
-| **Suggestions / report (LLM)** | **Gemini Flash** (already wired) | Cheap, already behind `LlmProvider`. |
+| **Host lines / report (LLM)** | **Gemini Flash** (already wired) | Cheap, already behind `LlmProvider`. |
 
 **Net:** the only meaningful recurring cost is **STT minutes** (plus a small TURN
 relay bill). No paid SFU. This is the cheapest architecture that still delivers
@@ -70,7 +70,7 @@ group voice + server-side AI listening.
   │  RoomsService.addTranscriptSegment()  ──►  TranscriptSegment (Firestore)│
   │                                                              │         │
   │  Facilitator engine (EXISTING): volume/silence triggers ─────┤         │
-  │        → generateTopicSuggestion() → 'topicSuggested' emit    │         │
+  │        → consultHost() → 'hostMessage' emit    │         │
   │        → on end: generateReport() → 'sessionEnded' emit       ┘         │
   └──────────────────────────────────────────────────────────────────────┘
                                    │
@@ -88,11 +88,11 @@ group voice + server-side AI listening.
 
 ### Reuse (already built, unchanged)
 - `RoomsService.addTranscriptSegment()` — the single ingestion point.
-- `TranscriptSegment`, `TopicSuggestion`, `RoomReport` entities + repository.
-- Facilitator policy + prompts (`shouldSuggestByVolume/BySilence`, topic + report
+- `TranscriptSegment`, `HostMessage`, `RoomReport` entities + repository.
+- Facilitator policy + prompts (`shouldEvaluateByVolume/BySilence`, host + report
   prompts/parsers).
-- `generateTopicSuggestion()`, `generateReport()`, room lifecycle, Socket.IO
-  broadcasts (`topicSuggested`, `sessionEnded`).
+- `consultHost()`, `generateReport()`, room lifecycle, Socket.IO
+  broadcasts (`hostMessage`, `sessionEnded`).
 - `LlmProvider` (Gemini) abstraction.
 
 > The facilitator does not care where transcript segments come from. Today a test
@@ -162,11 +162,11 @@ WebRTC signaling events (Socket.IO 'rooms' namespace):
 5. Server opens one SttProvider stream per {roomId, uid}.
 6. On each FINAL transcript → addTranscriptSegment() → segment persisted + emitted.
 7. Facilitator triggers (existing): every N segments OR X ms silence →
-   generateTopicSuggestion() → 'topicSuggested' pushed to the room DURING the call.
+   consultHost() → 'hostMessage' pushed to the room DURING the call.
 8. Owner ends room → generateReport() from full transcript → 'sessionEnded'.
 ```
 
-Latency budget for a suggestion ≈ STT finalization (~0.5–2 s) + LLM (~1–2 s). Fine
+Latency budget for a host line ≈ STT finalization (~0.5–2 s) + LLM (~1–2 s). Fine
 for a conversational nudge; it does not gate human audio (that is P2P).
 
 ---
@@ -187,13 +187,13 @@ Order-of-magnitude (validate against live pricing before launch):
 2. **Silence/hold gating** — stop the STT stream during long silences; reopen on VAD.
 3. **Chunked batch STT** instead of streaming for the non-caption path — cheaper per
    minute, acceptable latency for topic nudges (we only need finals).
-4. **Suggestion cadence** already config-gated (`ROOM_SUGGEST_EVERY_SEGMENTS`,
+4. **Host cadence** already config-gated (`ROOM_SUGGEST_EVERY_SEGMENTS`,
    `ROOM_SILENCE_MS`) — controls LLM spend independently.
 5. **TURN**: self-host `coturn` on a small VM; most mesh traffic uses STUN (free)
    and only NAT-restricted peers relay.
 
 **Guardrails to build:** per-room max minutes / hard stop, and a kill-switch env to
-disable STT (fall back to manual `suggest-topic`) if spend spikes.
+disable STT (fall back to manual `change-topic`) if spend spikes.
 
 ---
 
@@ -234,7 +234,7 @@ disable STT (fall back to manual `suggest-topic`) if spend spikes.
 | **M0** | Socket auth | Firebase-token handshake guard for the `rooms` namespace + participant check | unit + a socket auth test |
 | **M1** | Signaling + mesh voice | `webrtc:*` relay events; two browsers hear each other P2P | manual 2-client call |
 | **M2** | Audio ingest + STT | `AudioIngestGateway` + `SttProvider`/`GoogleSttProvider`; mic → transcript segments persisted | integration test with a fake SttProvider; live smoke with Google STT |
-| **M3** | Real-time suggestions | Existing facilitator triggers fire from STT-sourced segments → `topicSuggested` mid-call | e2e with faked STT feeding canned utterances |
+| **M3** | Real-time host | Existing facilitator triggers fire from STT-sourced segments → `hostMessage` mid-call | e2e with faked STT feeding canned utterances |
 | **M4** | End report from live session | `sessionEnded` report over a real call | manual + existing report tests |
 | **M5** | Cost controls + hardening | VAD gating, per-room minute cap, STT kill-switch, TURN credentials | load/cost test, chaos (STT down) |
 
@@ -262,6 +262,6 @@ facilitator built already is exercised end-to-end from M3 on.
 
 ## 12. Recommendation
 
-Proceed **M0 → M1 → M2 → M3** to reach the core promise (AI suggests topics during a
+Proceed **M0 → M1 → M2 → M3** to reach the core promise (AI host changes topics during a
 live, cheap, P2P voice call) with STT as the only real cost. Treat LiveKit/SFU as the
 explicit upgrade once rooms outgrow mesh — the seams here make that swap contained.

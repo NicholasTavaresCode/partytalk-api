@@ -11,8 +11,6 @@ export const COLLECTIONS = {
   ROOMS: 'rooms',
   /** Per-room subcollection of voice-transcript segments (STT output). */
   ROOM_SEGMENTS: 'segments',
-  /** Per-room subcollection of AI topic suggestions. */
-  ROOM_SUGGESTIONS: 'suggestions',
-  IELTS_EXAMS: 'ielts_exams',
-  IELTS_ATTEMPTS: 'ielts_attempts',
+  /** Per-room subcollection of the lines the AI host said (topic changes). */
+  ROOM_HOST_MESSAGES: 'hostMessages',
 } as const;

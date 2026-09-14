@@ -1,16 +1,19 @@
+import { HostMessage } from '../entities/host-message.entity';
 import { TranscriptSegment } from '../entities/transcript-segment.entity';
 
 /**
- * Pure decision logic for when the AI facilitator should interject with a new
- * topic. Kept free of timers and IO so it is trivially unit-testable; the
- * gateway owns the clock and calls these.
+ * Pure gating logic for WHEN the gateway should consult the AI host (which then
+ * makes the real call on whether to step in). Kept free of timers and IO so it
+ * is trivially unit-testable; the gateway owns the clock and calls these, and
+ * the LLM owns the final decision.
  */
 
 /**
- * Volume trigger: enough has been said since the last nudge. `sinceLast` counts
- * transcript segments captured since the previous suggestion (or room start).
+ * Volume gate: enough has been said since the last check to be worth consulting
+ * the host again. `sinceLast` counts transcript segments captured since the
+ * previous consultation (or room start). Bounds how often we call the model.
  */
-export function shouldSuggestByVolume(
+export function shouldEvaluateByVolume(
   sinceLast: number,
   everySegments: number,
 ): boolean {
@@ -18,11 +21,12 @@ export function shouldSuggestByVolume(
 }
 
 /**
- * Silence trigger: the room is live and has been quiet for at least `silenceMs`.
+ * Silence gate: the room is live and has been quiet for at least `silenceMs` —
+ * a strong signal the group may be stuck, so it is worth consulting the host.
  * Requires that at least one thing was said (`hasSpoken`) so we never nudge an
- * empty room, and that no suggestion is already the most recent event.
+ * empty room.
  */
-export function shouldSuggestBySilence(params: {
+export function shouldEvaluateBySilence(params: {
   isLive: boolean;
   hasSpoken: boolean;
   msSinceLastSegment: number;
@@ -32,12 +36,33 @@ export function shouldSuggestBySilence(params: {
   return isLive && hasSpoken && msSinceLastSegment >= silenceMs;
 }
 
+/** How the host's own lines are labelled when it re-reads the conversation. */
+export const HOST_SPEAKER_LABEL = 'Host (you)';
+
 /**
- * Render a rolling transcript window into plain text the model can read, one
- * line per utterance: `Name: text`. Falls back to the speaker id when no name.
+ * Render the conversation as the host heard it: participants' utterances and
+ * the host's own lines merged in time order, one line each (`Name: text`).
+ * Falls back to the speaker id when a participant has no display name.
  */
-export function formatTranscript(segments: TranscriptSegment[]): string {
-  return segments
-    .map((s) => `${s.speakerName ?? s.speakerId}: ${s.text}`)
+export function formatConversation(
+  segments: TranscriptSegment[],
+  hostMessages: HostMessage[] = [],
+  hostLabel: string = HOST_SPEAKER_LABEL,
+): string {
+  const lines = [
+    ...segments.map((s) => ({
+      at: s.at,
+      line: `${s.speakerName ?? s.speakerId}: ${s.text}`,
+    })),
+    ...hostMessages.map((m) => ({
+      at: m.at,
+      line: `${hostLabel}: ${m.message}`,
+    })),
+  ];
+  // Timestamps are ISO-8601, so plain string comparison orders them correctly.
+  // Array.prototype.sort is stable: on a tie, participants stay before the host.
+  return lines
+    .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))
+    .map((l) => l.line)
     .join('\n');
 }
