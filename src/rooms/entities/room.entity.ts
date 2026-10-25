@@ -72,6 +72,25 @@ export class Room {
   maxParticipants!: number;
 
   @ApiProperty({
+    type: [String],
+    required: false,
+    description:
+      'Lowercased emails of the Google accounts allowed into this invite-only room (the owner is always allowed). Returned only to the owner.',
+    example: ['bo@example.com'],
+  })
+  invitedEmails?: string[];
+
+  @ApiProperty({
+    type: String,
+    required: false,
+    nullable: true,
+    description:
+      'Secret for the shareable invite link (`/practice/{id}?invite={code}`); anyone signed in who redeems it is added to `invitedEmails`. `null` when the link is turned off. Returned only to the owner.',
+    example: 'q3Zl0tqS2mVJ8vV1i0b2Pw',
+  })
+  inviteCode?: string | null;
+
+  @ApiProperty({
     type: () => RoomReport,
     required: false,
     description:

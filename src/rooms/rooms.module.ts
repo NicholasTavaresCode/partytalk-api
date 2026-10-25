@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { UsersModule } from '../users/users.module';
 import { FirestoreRoomsRepository } from './firestore-rooms.repository';
 import { RoomsController } from './rooms.controller';
 import { RoomsGateway } from './rooms.gateway';
@@ -12,6 +13,8 @@ import { RoomsService } from './rooms.service';
  * features can reuse room logic without depending on the transport.
  */
 @Module({
+  // UsersRepository resolves a revoked invitee's email to their seat.
+  imports: [UsersModule],
   controllers: [RoomsController],
   providers: [
     RoomsService,

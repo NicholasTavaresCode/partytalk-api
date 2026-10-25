@@ -1,5 +1,8 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
+  ArrayMaxSize,
+  IsArray,
+  IsEmail,
   IsInt,
   IsOptional,
   IsString,
@@ -8,6 +11,7 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
+import { MAX_INVITES } from '../room-access';
 
 /**
  * Payload to open a new practice room. Every field is validated
@@ -51,4 +55,16 @@ export class CreateRoomDto {
   @Min(1)
   @Max(5)
   maxParticipants?: number;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description: `Emails of the Google accounts invited to this room (case-insensitive, deduplicated, up to ${MAX_INVITES}). Rooms are invite-only: nobody but the owner and invitees can see or join. Defaults to none.`,
+    example: ['bo@example.com', 'cy@example.com'],
+    maxItems: MAX_INVITES,
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_INVITES)
+  @IsEmail({}, { each: true })
+  invitedEmails?: string[];
 }

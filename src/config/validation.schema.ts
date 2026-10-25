@@ -9,17 +9,20 @@ export const validationSchema = Joi.object({
     .valid('development', 'test', 'production')
     .default('development'),
   PORT: Joi.number().port().default(3000),
-  CORS_ORIGINS: Joi.string().default('http://localhost:5173'),
+  CORS_ORIGINS: Joi.string().default('http://localhost:3000'),
+  TRUST_PROXY_HOPS: Joi.number().integer().min(0).default(0),
 
   GCP_PROJECT_ID: Joi.string().required(),
   GOOGLE_APPLICATION_CREDENTIALS: Joi.string().allow('').optional(),
   FIRESTORE_EMULATOR_HOST: Joi.string().allow('').optional(),
+  FIRESTORE_DATABASE_ID: Joi.string().allow('').optional(),
 
   // Google Identity ("Sign in with Google") — the frontend does the sign-in and
   // sends the resulting ID token; the API verifies it against this client id.
   GOOGLE_OAUTH_CLIENT_ID: Joi.string().required(),
   // Optional comma-separated Workspace domain allow-list. Empty = open sign-up.
   ALLOWED_AUTH_DOMAINS: Joi.string().allow('').optional(),
+  ALLOWED_AUTH_EMAILS: Joi.string().allow('').optional(),
   // TEMP local-testing flag: true bypasses Google token verification entirely.
   AUTH_DISABLED: Joi.boolean().default(false),
 
@@ -30,4 +33,9 @@ export const validationSchema = Joi.object({
   ROOM_SUGGEST_EVERY_SEGMENTS: Joi.number().integer().min(1).default(8),
   ROOM_SILENCE_MS: Joi.number().integer().min(1000).default(25000),
   ROOM_CONTEXT_SEGMENTS: Joi.number().integer().min(1).default(25),
+
+  STUN_URLS: Joi.string().allow('').optional(),
+  TURN_URLS: Joi.string().allow('').optional(),
+  TURN_SECRET: Joi.string().allow('').optional(),
+  TURN_CREDENTIAL_TTL_SECONDS: Joi.number().integer().min(60).default(21600),
 });

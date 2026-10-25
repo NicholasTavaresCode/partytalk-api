@@ -1,0 +1,10 @@
+# What `gcloud run deploy --source .` uploads to Cloud Build. The Dockerfile installs
+# and builds from scratch, so local build output and env files must stay behind —
+# .env in particular would be baked into the image and loaded at boot.
+.gcloudignore
+.git
+.gitignore
+#!include:.gitignore
+coverage/
+test/
+docs/

@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
   HttpStatus,
@@ -24,6 +25,9 @@ import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-princ
 import { ApiEnvelopeResponse } from '../common/swagger/api-envelope';
 import { ErrorResponseDto } from '../common/swagger/error-response.dto';
 import { CreateRoomDto } from './dto/create-room.dto';
+import { IceServers } from './entities/ice-servers.entity';
+import { InviteEmailsDto } from './dto/invite-emails.dto';
+import { JoinRoomDto } from './dto/join-room.dto';
 import { PostTranscriptDto } from './dto/post-transcript.dto';
 import { Room } from './entities/room.entity';
 import { TopicSuggestion } from './entities/topic-suggestion.entity';
@@ -37,10 +41,21 @@ const ROOM_ID_PARAM = {
   example: 'b3f1c2d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d',
 } as const;
 
+const NOT_INVITED_RESPONSE = {
+  type: ErrorResponseDto,
+  description:
+    'The caller is neither the owner nor invited (rooms are invite-only), or has not joined yet where a seat is required.',
+} as const;
+
+const OWNER_ONLY_RESPONSE = {
+  type: ErrorResponseDto,
+  description: 'Only the room owner may manage invites.',
+} as const;
+
 /**
  * REST surface for rooms. Every route is behind the global GoogleAuthGuard,
- * so the caller's uid always comes from the verified token (never the body) —
- * ownership/participation checks live in the service. Realtime voice flows over
+ * so the caller's uid and email always come from the verified token (never the
+ * body) — the invite-only access rules live in the service. Realtime voice flows over
  * the Socket.IO `rooms` namespace; these endpoints own persistence, the manual
  * facilitator trigger, and reads.
  */
@@ -61,38 +76,41 @@ export class RoomsController {
   @ApiOperation({
     summary: 'Create a room',
     description:
-      'Opens a new practice room owned by the caller. The room starts in `waiting` status with the owner as its sole participant. `facilitatorPersona` and `maxParticipants` default when omitted. The AI facilitator stays silent until people begin talking.',
+      'Opens a new invite-only practice room owned by the caller. The room starts in `waiting` status with the owner as its sole participant; only the owner and the `invitedEmails` can see or join it. `facilitatorPersona` and `maxParticipants` default when omitted. The AI facilitator stays silent until people begin talking.',
   })
   @ApiEnvelopeResponse(Room, {
     created: true,
     description: 'The created room.',
   })
   create(
-    @CurrentUser('uid') uid: string,
+    @CurrentUser() user: AuthenticatedPrincipal,
     @Body() dto: CreateRoomDto,
   ): Promise<Room> {
-    return this.roomsService.createRoom(uid, dto);
+    return this.roomsService.createRoom(user, dto);
   }
 
   @Get()
   @ApiOperation({
-    summary: 'List open rooms',
+    summary: 'List my open rooms',
     description:
-      'Returns rooms still joinable — `waiting` or `live` — ordered newest first. `ended` rooms are excluded. Use `limit` to cap the page size.',
+      'Returns the `waiting` or `live` rooms the caller owns or is invited to, newest first — other people’s rooms never appear. `ended` rooms are excluded. Use `limit` to cap the page size.',
   })
   @ApiEnvelopeResponse(Room, {
     isArray: true,
-    description: 'Open (waiting/live) rooms, newest first.',
+    description: 'The caller’s open (waiting/live) rooms, newest first.',
   })
-  listOpen(@Query() query: PaginationQueryDto): Promise<Room[]> {
-    return this.roomsService.listOpenRooms(query.limit);
+  listOpen(
+    @CurrentUser() user: AuthenticatedPrincipal,
+    @Query() query: PaginationQueryDto,
+  ): Promise<Room[]> {
+    return this.roomsService.listRoomsFor(user, query.limit);
   }
 
   @Get(':id')
   @ApiOperation({
     summary: 'Get a room',
     description:
-      'Fetches a single room by id in any lifecycle state (including `ended`, where the `report` is present). Returns 404 if no room with that id exists.',
+      'Fetches a single room by id in any lifecycle state (including `ended`, where the `report` is present). Owner or invitees only (403 otherwise); `invitedEmails` and `inviteCode` are returned to the owner only. Returns 404 if no room with that id exists.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, { description: 'The requested room.' })
@@ -100,15 +118,19 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
-  getOne(@Param('id') id: string): Promise<Room> {
-    return this.roomsService.getRoom(id);
+  @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
+  getOne(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedPrincipal,
+  ): Promise<Room> {
+    return this.roomsService.getRoomFor(id, user);
   }
 
   @Post(':id/join')
   @ApiOperation({
     summary: 'Join a room',
     description:
-      'Adds the caller to the room’s participants. Idempotent — already-joined callers get the room unchanged. Fails with 409 if the room has ended or is at `maxParticipants`, and 404 if it does not exist.',
+      'Adds the caller to the room’s participants. Only the owner and invitees may join — or anyone signed in who presents the room’s current `inviteCode` (from the owner’s invite link), whose email is then added to `invitedEmails`. Idempotent — already-joined callers get the room unchanged. Fails with 403 if not invited, 409 if the room has ended or is at `maxParticipants`, and 404 if it does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(Room, { description: 'The room including the caller.' })
@@ -116,15 +138,17 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
+  @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
   @ApiConflictResponse({
     type: ErrorResponseDto,
     description: 'Room is full or already ended.',
   })
   join(
     @Param('id') id: string,
-    @CurrentUser('uid') uid: string,
+    @CurrentUser() user: AuthenticatedPrincipal,
+    @Body() dto: JoinRoomDto,
   ): Promise<Room> {
-    return this.roomsService.joinRoom(id, uid);
+    return this.roomsService.joinRoom(id, user, dto.inviteCode);
   }
 
   @Post(':id/leave')
@@ -139,11 +163,12 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
+  @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
   leave(
     @Param('id') id: string,
-    @CurrentUser('uid') uid: string,
+    @CurrentUser() user: AuthenticatedPrincipal,
   ): Promise<Room> {
-    return this.roomsService.leaveRoom(id, uid);
+    return this.roomsService.leaveRoom(id, user);
   }
 
   @Post(':id/start')
@@ -200,7 +225,7 @@ export class RoomsController {
   @ApiOperation({
     summary: 'Get the transcript',
     description:
-      'Returns the room’s voice-transcript segments (speech-to-text), oldest first. Use `limit` to cap the number returned. Returns 404 if the room does not exist.',
+      'Returns the room’s most recent voice-transcript segments (speech-to-text), oldest first. Owner or invitees only (403 otherwise). `limit` caps how many of the latest are returned. Returns 404 if the room does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(TranscriptSegment, {
@@ -211,11 +236,13 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
+  @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
   getTranscript(
     @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedPrincipal,
     @Query() query: PaginationQueryDto,
   ): Promise<TranscriptSegment[]> {
-    return this.roomsService.listTranscript(id, query.limit);
+    return this.roomsService.listTranscript(id, user, query.limit);
   }
 
   @Post(':id/transcript')
@@ -223,7 +250,7 @@ export class RoomsController {
   @ApiOperation({
     summary: 'Add a transcript segment',
     description:
-      'Persists one transcript segment spoken by the caller — a REST alternative to the realtime `transcript` socket event, useful for testing and non-socket clients. Does not itself trigger a suggestion (auto-triggers run in the gateway). Returns 404 if the room does not exist.',
+      'Persists one transcript segment spoken by the caller — a REST alternative to the realtime `transcript` socket event, useful for testing and non-socket clients. Does not itself trigger a suggestion (auto-triggers run in the gateway). Only invited callers who have joined may post (403 otherwise). Returns 404 if the room does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(TranscriptSegment, {
@@ -234,6 +261,7 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
+  @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
   addTranscript(
     @Param('id') id: string,
     @CurrentUser() user: AuthenticatedPrincipal,
@@ -241,7 +269,7 @@ export class RoomsController {
   ): Promise<TranscriptSegment> {
     return this.roomsService.addTranscriptSegment(
       id,
-      { uid: user.uid, name: dto.speakerName ?? user.name },
+      { uid: user.uid, email: user.email, name: dto.speakerName ?? user.name },
       dto.text,
     );
   }
@@ -251,7 +279,7 @@ export class RoomsController {
   @ApiOperation({
     summary: 'Suggest a topic now (manual trigger)',
     description:
-      'Forces the AI facilitator to read the recent transcript and produce one new, related topic immediately — the same engine the automatic volume/silence triggers use. Returns 404 if the room does not exist.',
+      'Forces the AI facilitator to read the recent transcript and produce one new, related topic immediately — the same engine the automatic volume/silence triggers use. Only invited callers who have joined may trigger it (403 otherwise), since it spends AI budget. Returns 404 if the room does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(TopicSuggestion, {
@@ -262,15 +290,19 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
-  suggestTopic(@Param('id') id: string): Promise<TopicSuggestion> {
-    return this.roomsService.generateTopicSuggestion(id, 'manual');
+  @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
+  suggestTopic(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedPrincipal,
+  ): Promise<TopicSuggestion> {
+    return this.roomsService.suggestTopicFor(id, user);
   }
 
   @Get(':id/suggestions')
   @ApiOperation({
     summary: 'List topic suggestions',
     description:
-      'Returns the AI facilitator’s topic suggestions for the room, oldest first. Returns 404 if the room does not exist.',
+      'Returns the AI facilitator’s most recent topic suggestions for the room, oldest first. Owner or invitees only (403 otherwise). `limit` caps how many of the latest are returned. Returns 404 if the room does not exist.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(TopicSuggestion, {
@@ -281,10 +313,135 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
+  @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
   getSuggestions(
     @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedPrincipal,
     @Query() query: PaginationQueryDto,
   ): Promise<TopicSuggestion[]> {
-    return this.roomsService.listSuggestions(id, query.limit);
+    return this.roomsService.listSuggestions(id, user, query.limit);
+  }
+
+  @Get(':id/ice-servers')
+  @ApiOperation({
+    summary: 'Get ICE servers for voice',
+    description:
+      'The `RTCConfiguration.iceServers` for the caller’s P2P voice connections in this room: STUN, plus the TURN relay with a credential valid for `ttlSeconds` when a relay is configured. Only invited callers who have joined (403 otherwise), since a TURN credential lets its holder relay traffic through our server. Returns 404 if the room does not exist.',
+  })
+  @ApiParam(ROOM_ID_PARAM)
+  @ApiEnvelopeResponse(IceServers, {
+    description: 'ICE servers for this caller.',
+  })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
+  @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
+  getIceServers(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedPrincipal,
+  ): Promise<IceServers> {
+    return this.roomsService.iceServersFor(id, user);
+  }
+
+  @Post(':id/invites')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Invite people',
+    description:
+      'Adds emails to the room’s invite list (case-insensitive; already-invited addresses and the owner’s own are ignored). Those Google accounts can then see and join the room. Owner-only. Returns 400 past the invite cap and 404 if the room does not exist.',
+  })
+  @ApiParam(ROOM_ID_PARAM)
+  @ApiEnvelopeResponse(Room, {
+    description: 'The room with its updated invite list.',
+  })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
+  @ApiForbiddenResponse(OWNER_ONLY_RESPONSE)
+  addInvites(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedPrincipal,
+    @Body() dto: InviteEmailsDto,
+  ): Promise<Room> {
+    return this.roomsService.addInvites(id, user, dto.emails);
+  }
+
+  @Delete(':id/invites/:email')
+  @ApiOperation({
+    summary: 'Revoke an invite',
+    description:
+      'Removes an email from the invite list. If that person has joined, they lose their seat and their live sockets are kicked out of the room and voice call immediately (`removedFromRoom` event). Idempotent. Owner-only. Returns 404 if the room does not exist.',
+  })
+  @ApiParam(ROOM_ID_PARAM)
+  @ApiParam({
+    name: 'email',
+    description: 'The invited email to revoke.',
+    example: 'bo@example.com',
+  })
+  @ApiEnvelopeResponse(Room, { description: 'The room without that invite.' })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
+  @ApiForbiddenResponse(OWNER_ONLY_RESPONSE)
+  async revokeInvite(
+    @Param('id') id: string,
+    @Param('email') email: string,
+    @CurrentUser('uid') uid: string,
+  ): Promise<Room> {
+    const { room, removedUids } = await this.roomsService.revokeInvite(
+      id,
+      uid,
+      email,
+    );
+    await this.roomsGateway.evictFromRoom(id, removedUids, email);
+    return room;
+  }
+
+  @Post(':id/invite-link')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Create or rotate the invite link',
+    description:
+      'Mints a fresh `inviteCode` for the shareable link `/practice/{id}?invite={code}`. Anyone signed in who opens it can join and is added to the invite list. Calling again rotates the code, so previously shared links stop working (people already admitted keep access). Owner-only.',
+  })
+  @ApiParam(ROOM_ID_PARAM)
+  @ApiEnvelopeResponse(Room, {
+    description: 'The room with its new `inviteCode`.',
+  })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
+  @ApiForbiddenResponse(OWNER_ONLY_RESPONSE)
+  createInviteLink(
+    @Param('id') id: string,
+    @CurrentUser('uid') uid: string,
+  ): Promise<Room> {
+    return this.roomsService.createInviteLink(id, uid);
+  }
+
+  @Delete(':id/invite-link')
+  @ApiOperation({
+    summary: 'Turn off the invite link',
+    description:
+      'Clears the `inviteCode` so the shared link no longer admits anyone. People already admitted keep access until revoked. Owner-only.',
+  })
+  @ApiParam(ROOM_ID_PARAM)
+  @ApiEnvelopeResponse(Room, {
+    description: 'The room with `inviteCode: null`.',
+  })
+  @ApiNotFoundResponse({
+    type: ErrorResponseDto,
+    description: 'Room not found.',
+  })
+  @ApiForbiddenResponse(OWNER_ONLY_RESPONSE)
+  disableInviteLink(
+    @Param('id') id: string,
+    @CurrentUser('uid') uid: string,
+  ): Promise<Room> {
+    return this.roomsService.disableInviteLink(id, uid);
   }
 }

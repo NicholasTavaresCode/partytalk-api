@@ -14,6 +14,16 @@ import { IeltsModule } from './ielts/ielts.module';
 import { RoomsModule } from './rooms/rooms.module';
 import { UsersModule } from './users/users.module';
 
+/** pino level label → Cloud Logging severity. */
+const CLOUD_LOGGING_SEVERITY: Record<string, string> = {
+  trace: 'DEBUG',
+  debug: 'DEBUG',
+  info: 'INFO',
+  warn: 'WARNING',
+  error: 'ERROR',
+  fatal: 'CRITICAL',
+};
+
 /**
  * Root module. Cross-cutting concerns are registered globally here so every
  * feature module inherits them: structured logging, request validation, a
@@ -44,6 +54,19 @@ import { UsersModule } from './users/users.module';
                   ignore: 'pid,hostname,req,res',
                 },
               },
+        // Production logs are JSON read by Cloud Logging: use the field names it
+        // understands, or every line lands as DEFAULT severity with an empty summary.
+        ...(process.env.NODE_ENV === 'production'
+          ? {
+              messageKey: 'message',
+              formatters: {
+                level: (label: string) => ({
+                  severity: CLOUD_LOGGING_SEVERITY[label] ?? 'DEFAULT',
+                  level: label,
+                }),
+              },
+            }
+          : {}),
         redact: ['req.headers.authorization', 'req.headers.cookie'],
         autoLogging: process.env.NODE_ENV !== 'test',
         // Make failures stand out: 4xx → warn, 5xx/errors → error.

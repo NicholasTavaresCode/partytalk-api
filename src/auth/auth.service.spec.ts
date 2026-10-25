@@ -46,11 +46,14 @@ describe('AuthService', () => {
   let verifier: FakeVerifier;
   let repo: InMemoryUsersRepository;
 
-  const build = (auth: { allowedAuthDomains?: string[] } = {}): AuthService => {
+  const build = (
+    auth: { allowedAuthDomains?: string[]; allowedAuthEmails?: string[] } = {},
+  ): AuthService => {
     const config = {
       get: () => ({
         googleOAuthClientId: 'client-id',
         allowedAuthDomains: auth.allowedAuthDomains ?? [],
+        allowedAuthEmails: auth.allowedAuthEmails ?? [],
       }),
     } as unknown as ConfigService;
     return new AuthService(verifier, repo, config as ConfigService);
@@ -150,6 +153,32 @@ describe('AuthService', () => {
         build({ allowedAuthDomains: ['corp.com'] }).authenticate('t'),
       ).rejects.toBeInstanceOf(ForbiddenException);
       expect(repo.store.size).toBe(0); // never provisioned
+    });
+  });
+
+  describe('email allow-list', () => {
+    it('allows a listed email, case-insensitively', async () => {
+      verifier.identity = { ...verifier.identity, email: 'Ada@Example.com' };
+      await expect(
+        build({ allowedAuthEmails: ['ada@example.com'] }).authenticate('t'),
+      ).resolves.toMatchObject({ uid: 'sub-1' });
+    });
+
+    it('rejects an unlisted email before provisioning (403)', async () => {
+      await expect(
+        build({ allowedAuthEmails: ['bo@example.com'] }).authenticate('t'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(repo.store.size).toBe(0);
+    });
+
+    it('combines with the domain list: either match is enough', async () => {
+      const auth = build({
+        allowedAuthEmails: ['bo@other.com'],
+        allowedAuthDomains: ['example.com'],
+      });
+      await expect(auth.authenticate('t')).resolves.toMatchObject({
+        uid: 'sub-1',
+      });
     });
   });
 });

@@ -2,8 +2,8 @@ import * as admin from 'firebase-admin';
 import { AppConfig } from '../config/configuration';
 
 /**
- * Lazily initialize (and memoize) the single firebase-admin app used for both
- * Firestore and Firebase Auth. Initializing more than once throws, so we guard
+ * Lazily initialize (and memoize) the single firebase-admin app used for
+ * Firestore. Initializing more than once throws, so we guard
  * on `admin.apps.length`. Credentials come from Application Default Credentials
  * unless a key path is provided; the Firestore emulator is honored via the
  * standard `FIRESTORE_EMULATOR_HOST` env var read by the SDK.

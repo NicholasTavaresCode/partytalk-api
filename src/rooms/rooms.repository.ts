@@ -17,12 +17,22 @@ export abstract class RoomsRepository {
   ): Promise<Room | null>;
   abstract delete(id: string): Promise<void>;
 
-  /** Rooms still open to join (status `waiting` or `live`), newest first. */
-  abstract listOpen(limit: number): Promise<Room[]>;
+  /**
+   * Open rooms (status `waiting` or `live`) the user owns or whose invite list
+   * holds `email` (already normalized), newest first.
+   */
+  abstract listOpenForMember(
+    uid: string,
+    email: string | undefined,
+    limit: number,
+  ): Promise<Room[]>;
 
   abstract addSegment(segment: TranscriptSegment): Promise<TranscriptSegment>;
 
-  /** A room's transcript segments in chronological order (oldest first). */
+  /**
+   * A room's most recent `limit` transcript segments, in chronological order
+   * (oldest first) — the facilitator's rolling context window.
+   */
   abstract listSegments(
     roomId: string,
     limit: number,
@@ -33,7 +43,7 @@ export abstract class RoomsRepository {
 
   abstract addSuggestion(suggestion: TopicSuggestion): Promise<TopicSuggestion>;
 
-  /** A room's topic suggestions in chronological order (oldest first). */
+  /** A room's most recent `limit` topic suggestions, oldest first. */
   abstract listSuggestions(
     roomId: string,
     limit: number,

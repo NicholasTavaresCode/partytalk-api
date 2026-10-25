@@ -18,6 +18,14 @@ async function bootstrap(): Promise<void> {
 
   const config = app.get(ConfigService<AppConfig, true>);
 
+  // Behind Cloud Run every request arrives from its front end, so without this
+  // `req.ip` — the ThrottlerGuard's key — is one shared proxy address and all
+  // users share a single rate-limit budget.
+  const trustProxyHops = config.get('trustProxyHops', { infer: true });
+  if (trustProxyHops > 0) {
+    app.set('trust proxy', trustProxyHops);
+  }
+
   // Security headers (security-sanitize-output) + tight CORS.
   app.use(helmet());
   // A literal "*" cannot be combined with credentials — the browser needs the
@@ -55,7 +63,9 @@ async function bootstrap(): Promise<void> {
   );
   logger.log(
     `CORS allowed origins: ${
-      allowAnyOrigin ? '(any origin — reflected)' : corsOrigins.join(', ') || '(none)'
+      allowAnyOrigin
+        ? '(any origin — reflected)'
+        : corsOrigins.join(', ') || '(none)'
     }`,
   );
   if (auth.disabled) {
@@ -67,7 +77,34 @@ async function bootstrap(): Promise<void> {
       `Auth: Google Identity — expected client id (aud): ${auth.googleOAuthClientId || '(UNSET!)'}`,
     );
     logger.log(
-      `Auth domain allow-list: ${auth.allowedAuthDomains.join(', ') || '(open sign-up — any verified Google account)'}`,
+      auth.allowedAuthDomains.length || auth.allowedAuthEmails.length
+        ? `Auth allow-list: ${auth.allowedAuthEmails.length} email(s), domains: ${auth.allowedAuthDomains.join(', ') || '(none)'}`
+        : 'Auth allow-list: (open sign-up — any verified Google account)',
+    );
+  }
+
+  const gcp = config.get('gcp', { infer: true });
+  logger.log(
+    `Firestore: database "${gcp.firestoreDatabaseId}" ${
+      gcp.firestoreEmulatorHost
+        ? `on the emulator at ${gcp.firestoreEmulatorHost}`
+        : `in project ${gcp.projectId}`
+    }`,
+  );
+  if (env !== 'production' && !gcp.firestoreEmulatorHost) {
+    logger.warn(
+      `Using the REAL Firestore of ${gcp.projectId} from a ${env} build — set FIRESTORE_EMULATOR_HOST to keep local data out of it.`,
+    );
+  }
+
+  const webrtc = config.get('webrtc', { infer: true });
+  if (webrtc.turnUrls.length && !webrtc.turnSecret) {
+    logger.warn(
+      'TURN_URLS is set but TURN_SECRET is not — the voice relay is OFF (STUN only).',
+    );
+  } else {
+    logger.log(
+      `Voice ICE: STUN${webrtc.turnSecret && webrtc.turnUrls.length ? ` + TURN relay (${webrtc.turnUrls.join(', ')})` : ' only — no relay for strict NATs'}`,
     );
   }
 }
