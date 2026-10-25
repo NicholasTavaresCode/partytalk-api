@@ -56,7 +56,7 @@ GOOGLE_OAUTH_CLIENT_ID=484961620847-joi2l06qeuem1ocna1fnt4n907j8gp7g.apps.google
 # every other verified account is refused with 403 before a user record is created.
 # Add a tester here (and to the OAuth "Audience" test users), then redeploy — it is read
 # at boot. Comma-separated, case-insensitive.
-ALLOWED_AUTH_EMAILS="nicholasbalby@gmail.com,nicholasbalby@hotmail.com"
+ALLOWED_AUTH_EMAILS="nicholasbalby@gmail.com,nicholasbalby@hotmail.com,jr21.nic@gmail.com"
 
 # One flag with a custom '|' delimiter, because some values contain commas.
 ENV_VARS="^|^NODE_ENV=production"

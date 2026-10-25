@@ -39,8 +39,14 @@ interface SignalPayload {
   candidate?: unknown;
 }
 
-/** The authenticated user is attached to the socket at connection time. */
-type AuthedSocket = Socket & { data: { user?: AuthenticatedPrincipal } };
+/**
+ * The authenticated user is attached to the socket at connection time; `rooms`
+ * remembers which rooms it entered, because Socket.IO has already emptied
+ * `socket.rooms` by the time `handleDisconnect` runs.
+ */
+type AuthedSocket = Socket & {
+  data: { user?: AuthenticatedPrincipal; rooms?: Set<string> };
+};
 
 /** Per-room facilitator state kept in memory on this socket-server instance. */
 interface RoomState {
@@ -120,14 +126,20 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     }
   }
 
-  /** Drop the socket from any voice mesh so peers tear down its connection. */
-  handleDisconnect(client: AuthedSocket): void {
+  /**
+   * Drop the socket from any voice mesh so peers tear down its connection, and
+   * tell its rooms the person left — a closed tab never sends `leaveRoom`.
+   */
+  async handleDisconnect(client: AuthedSocket): Promise<void> {
     const uid = client.data.user?.uid;
     if (!uid) {
       return;
     }
     for (const roomId of [...this.voice.keys()]) {
       this.leaveVoice(roomId, uid, client.id);
+    }
+    for (const roomId of client.data.rooms ?? []) {
+      await this.announceLeftIfGone(roomId, uid);
     }
   }
 
@@ -142,6 +154,13 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     }
 
     await client.join(payload.roomId);
+    (client.data.rooms ??= new Set()).add(payload.roomId);
+    // `presence` only reports people who join later, so hand the newcomer
+    // everyone already here — otherwise the host shows up as an offline "Guest".
+    client.emit('roster', {
+      roomId: payload.roomId,
+      members: await this.membersOf(payload.roomId),
+    });
     this.server.to(payload.roomId).emit('presence', {
       roomId: payload.roomId,
       uid: user.uid,
@@ -158,11 +177,8 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     const user = this.requireUser(client);
     this.leaveVoice(payload.roomId, user.uid, client.id);
     await client.leave(payload.roomId);
-    this.server.to(payload.roomId).emit('presence', {
-      roomId: payload.roomId,
-      uid: user.uid,
-      event: 'left',
-    });
+    client.data.rooms?.delete(payload.roomId);
+    await this.announceLeftIfGone(payload.roomId, user.uid);
   }
 
   @SubscribeMessage('transcript')
@@ -283,6 +299,7 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
         continue;
       }
       socket.leave(roomId);
+      (socket.data as AuthedSocket['data']).rooms?.delete(roomId);
       this.leaveVoice(roomId, user.uid, socket.id);
       socket.emit('removedFromRoom', { roomId });
       this.server
@@ -296,6 +313,39 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
         this.leaveVoice(roomId, uid, socketId);
       }
     }
+  }
+
+  /**
+   * Tell everyone in the room that its REST state changed — someone joined or
+   * left, the host started it, an invite was revoked — so each client refetches
+   * `GET /rooms/:id`. Deliberately carries no room data: that endpoint filters
+   * owner-only fields per caller, and broadcasting the room would hand every
+   * participant the invite list and link code.
+   */
+  notifyRoomUpdated(roomId: string): void {
+    this.server.to(roomId).emit('roomUpdated', { roomId });
+  }
+
+  /** Who is connected to the room right now, one entry per person. */
+  private async membersOf(
+    roomId: string,
+  ): Promise<{ uid: string; name?: string }[]> {
+    const members = new Map<string, string | undefined>();
+    for (const socket of await this.server.in(roomId).fetchSockets()) {
+      const user = (socket.data as AuthedSocket['data']).user;
+      if (user) {
+        members.set(user.uid, user.name);
+      }
+    }
+    return [...members].map(([uid, name]) => ({ uid, name }));
+  }
+
+  /** Announce `left` only once the person's last socket in the room is gone. */
+  private async announceLeftIfGone(roomId: string, uid: string): Promise<void> {
+    if ((await this.membersOf(roomId)).some((m) => m.uid === uid)) {
+      return; // still here in another tab
+    }
+    this.server.to(roomId).emit('presence', { roomId, uid, event: 'left' });
   }
 
   /** Broadcast the end-of-session report and drop the room's timers/state. */

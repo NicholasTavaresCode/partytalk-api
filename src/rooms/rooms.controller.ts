@@ -143,12 +143,14 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room is full or already ended.',
   })
-  join(
+  async join(
     @Param('id') id: string,
     @CurrentUser() user: AuthenticatedPrincipal,
     @Body() dto: JoinRoomDto,
   ): Promise<Room> {
-    return this.roomsService.joinRoom(id, user, dto.inviteCode);
+    const room = await this.roomsService.joinRoom(id, user, dto.inviteCode);
+    this.roomsGateway.notifyRoomUpdated(id); // the others' tiles come from GET /rooms/:id
+    return room;
   }
 
   @Post(':id/leave')
@@ -164,11 +166,13 @@ export class RoomsController {
     description: 'Room not found.',
   })
   @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
-  leave(
+  async leave(
     @Param('id') id: string,
     @CurrentUser() user: AuthenticatedPrincipal,
   ): Promise<Room> {
-    return this.roomsService.leaveRoom(id, user);
+    const room = await this.roomsService.leaveRoom(id, user);
+    this.roomsGateway.notifyRoomUpdated(id);
+    return room;
   }
 
   @Post(':id/start')
@@ -187,11 +191,14 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Only the room owner may start/end the room.',
   })
-  start(
+  async start(
     @Param('id') id: string,
     @CurrentUser('uid') uid: string,
   ): Promise<Room> {
-    return this.roomsService.startRoom(id, uid);
+    const room = await this.roomsService.startRoom(id, uid);
+    // Participants only enable their mic and voice once they see `live`.
+    this.roomsGateway.notifyRoomUpdated(id);
+    return room;
   }
 
   @Post(':id/end')
@@ -397,6 +404,7 @@ export class RoomsController {
       email,
     );
     await this.roomsGateway.evictFromRoom(id, removedUids, email);
+    this.roomsGateway.notifyRoomUpdated(id);
     return room;
   }
 

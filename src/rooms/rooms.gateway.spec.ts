@@ -44,7 +44,10 @@ describe('RoomsGateway', () => {
       emit: jest.fn(),
       disconnect: jest.fn(),
     }) as unknown as Socket & {
-      data: { user?: { uid: string; name?: string; email?: string } };
+      data: {
+        user?: { uid: string; name?: string; email?: string };
+        rooms?: Set<string>;
+      };
     };
 
   const segment = {
@@ -347,7 +350,7 @@ describe('RoomsGateway', () => {
       const ada = socket('u1');
       await gateway.handleWebrtcJoin(ada, { roomId: 'r1' });
 
-      gateway.handleDisconnect(ada);
+      await gateway.handleDisconnect(ada);
 
       expect(server.to).toHaveBeenCalledWith('r1');
       expect(emit).toHaveBeenCalledWith('webrtc:peer-left', { uid: 'u1' });
@@ -360,11 +363,81 @@ describe('RoomsGateway', () => {
       await gateway.handleWebrtcJoin(oldTab, { roomId: 'r1' });
       await gateway.handleWebrtcJoin(newTab, { roomId: 'r1' });
 
-      gateway.handleDisconnect(oldTab);
+      await gateway.handleDisconnect(oldTab);
 
       expect(emit).not.toHaveBeenCalledWith(
         'webrtc:peer-left',
         expect.anything(),
+      );
+    });
+  });
+
+  describe('keeping everyone’s view of the room current', () => {
+    it('tells the room its REST state changed, without leaking any room data', () => {
+      const gateway = buildGateway(8);
+
+      gateway.notifyRoomUpdated('r1');
+
+      expect(server.to).toHaveBeenCalledWith('r1');
+      expect(emit).toHaveBeenCalledWith('roomUpdated', { roomId: 'r1' });
+    });
+
+    it('hands a newcomer everyone already connected, one entry per person', async () => {
+      const gateway = buildGateway(8);
+      const host = socket('owner', 'Hana');
+      const hostSecondTab = { ...socket('owner', 'Hana'), id: 'sock-owner-2' };
+      const bo = socket('u1', 'Bo');
+      fetchSockets.mockResolvedValue([host, hostSecondTab, bo]);
+      service.getRoom.mockResolvedValue({
+        id: 'r1',
+        ownerId: 'owner',
+        participantIds: ['owner', 'u1'],
+        invitedEmails: ['u1@example.com'],
+      });
+
+      await gateway.handleJoinRoom(bo, { roomId: 'r1' });
+
+      expect(bo.emit).toHaveBeenCalledWith('roster', {
+        roomId: 'r1',
+        members: [
+          { uid: 'owner', name: 'Hana' },
+          { uid: 'u1', name: 'Bo' },
+        ],
+      });
+      expect(emit).toHaveBeenCalledWith(
+        'presence',
+        expect.objectContaining({ uid: 'u1', event: 'joined' }),
+      );
+    });
+
+    it('announces "left" when a closed tab was the person’s last socket', async () => {
+      const gateway = buildGateway(8);
+      const bo = socket('u1', 'Bo');
+      bo.data.rooms = new Set(['r1']);
+      fetchSockets.mockResolvedValue([]); // nobody of theirs left in r1
+
+      await gateway.handleDisconnect(bo);
+
+      expect(emit).toHaveBeenCalledWith('presence', {
+        roomId: 'r1',
+        uid: 'u1',
+        event: 'left',
+      });
+    });
+
+    it('stays quiet while the person is still there in another tab', async () => {
+      const gateway = buildGateway(8);
+      const closedTab = socket('u1', 'Bo');
+      closedTab.data.rooms = new Set(['r1']);
+      fetchSockets.mockResolvedValue([
+        { ...socket('u1', 'Bo'), id: 'sock-u1-2' },
+      ]);
+
+      await gateway.handleDisconnect(closedTab);
+
+      expect(emit).not.toHaveBeenCalledWith(
+        'presence',
+        expect.objectContaining({ event: 'left' }),
       );
     });
   });

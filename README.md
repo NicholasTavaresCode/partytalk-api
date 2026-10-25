@@ -114,7 +114,7 @@ token.
 | Rooms  | `POST/GET /rooms`, `GET /rooms/:id`, `POST /rooms/:id/{join,leave,start,end}` | Invite-only: owner + `invitedEmails` (403 otherwise); `GET /rooms` lists only yours/invited; `end` generates the room report |
 | Invites | `POST /rooms/:id/invites`, `DELETE /rooms/:id/invites/:email`, `POST/DELETE /rooms/:id/invite-link` | Owner-only. Revoking kicks the person out live (`removedFromRoom`); the invite link (`join { inviteCode }`) adds the joiner's email to the list |
 | Rooms  | `GET/POST /rooms/:id/transcript`, `POST /rooms/:id/suggest-topic`, `GET /rooms/:id/suggestions` | Voice transcript + AI topic nudges |
-| Rooms  | Socket.IO namespace `rooms` | in: `joinRoom`, `leaveRoom`, `transcript`; out: `presence`, `transcript`, `topicSuggested`, `sessionEnded` |
+| Rooms  | Socket.IO namespace `rooms` | in: `joinRoom`, `leaveRoom`, `transcript`; out: `presence`, `roster`, `roomUpdated`, `transcript`, `topicSuggested`, `sessionEnded`, `removedFromRoom` |
 | Voice  | `GET /rooms/:id/ice-servers` | STUN + (when configured) TURN with a short-lived per-user credential; seated participants only |
 | Voice  | Socket.IO namespace `rooms` | WebRTC signaling relay — in: `webrtc:join`, `webrtc:offer`, `webrtc:answer`, `webrtc:ice`; out: `webrtc:peers`, `webrtc:peer-offer`, `webrtc:peer-answer`, `webrtc:peer-ice`, `webrtc:peer-left` |
 | IELTS  | `GET /ielts/exams`, `GET /ielts/exams/:id` | Browse content by section |

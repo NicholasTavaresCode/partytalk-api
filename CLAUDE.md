@@ -63,7 +63,9 @@ Being signed in is not enough to touch a room. The single rule is `canAccessRoom
 
 ### Rooms realtime
 
-`RoomsModule` wires both a REST `RoomsController` and a Socket.IO `RoomsGateway` (namespace `rooms`), and exports `RoomsService` so siblings reuse room logic without depending on the transport. Socket events — in: `joinRoom`, `leaveRoom`, `transcript`; out: `presence`, `transcript`, `topicSuggested`, `sessionEnded`, `removedFromRoom`, `error`.
+`RoomsModule` wires both a REST `RoomsController` and a Socket.IO `RoomsGateway` (namespace `rooms`), and exports `RoomsService` so siblings reuse room logic without depending on the transport. Socket events — in: `joinRoom`, `leaveRoom`, `transcript`; out: `presence`, `roster`, `roomUpdated`, `transcript`, `topicSuggested`, `sessionEnded`, `removedFromRoom`, `error`.
+
+**Keeping every client's room current.** The participant list and status live in the REST room, so after any REST change others must see (join, leave, start, revoke) the controller calls `RoomsGateway.notifyRoomUpdated`, which emits a **data-free** `roomUpdated` and makes each client refetch `GET /rooms/:id`. Never broadcast the room itself: views are filtered per caller and the owner's carries the invite list and link code. On `joinRoom` the newcomer gets `roster` (everyone connected now, one entry per uid) because `presence` only reports later arrivals. `presence: left` is announced only when a person's **last** socket leaves the room, including on disconnect; `client.data.rooms` tracks membership because Socket.IO empties `socket.rooms` before `handleDisconnect` runs.
 
 **Keep the transcript hot path free of I/O before the broadcast.** `transcript` is authorized by `client.rooms.has(roomId)` (sockets only enter a room after `joinRoom`'s participant check), built with `buildTranscriptSegment`, broadcast, and only *then* persisted with `saveTranscriptSegment` — the write must still finish before the facilitator triggers run, since they read history from the repository. The REST `POST /rooms/:id/transcript` path uses `addTranscriptSegment` (existence check + write).
 
