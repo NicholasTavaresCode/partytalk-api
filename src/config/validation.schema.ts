@@ -34,6 +34,13 @@ export const validationSchema = Joi.object({
   ROOM_SILENCE_MS: Joi.number().integer().min(1000).default(25000),
   ROOM_CONTEXT_SEGMENTS: Joi.number().integer().min(1).default(25),
 
+  SOCKET_IO_PUBSUB_TOPIC: Joi.string().allow('').optional(),
+  SMTP_HOST: Joi.string().allow('').optional(),
+  SMTP_PORT: Joi.number().port().optional(),
+  SMTP_USER: Joi.string().allow('').optional(),
+  SMTP_PASSWORD: Joi.string().allow('').optional(),
+  MAIL_FROM: Joi.string().allow('').optional(),
+  WEB_APP_URL: Joi.string().uri().allow('').optional(),
   STUN_URLS: Joi.string().allow('').optional(),
   TURN_URLS: Joi.string().allow('').optional(),
   TURN_SECRET: Joi.string().allow('').optional(),

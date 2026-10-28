@@ -36,6 +36,7 @@ import {
   RoomCaller,
 } from './room-access';
 import { buildIceServers } from './ice-servers';
+import { RoomInvitations } from './room-invitations';
 import { RoomsRepository } from './rooms.repository';
 
 const DEFAULT_FACILITATOR_PERSONA =
@@ -73,6 +74,7 @@ export class RoomsService {
   constructor(
     private readonly roomsRepository: RoomsRepository,
     private readonly usersRepository: UsersRepository,
+    private readonly invitations: RoomInvitations,
     private readonly llm: LlmProvider,
     config: ConfigService<AppConfig, true>,
   ) {
@@ -95,7 +97,9 @@ export class RoomsService {
       createdAt: now,
       updatedAt: now,
     };
-    return this.roomsRepository.create(room);
+    const created = await this.roomsRepository.create(room);
+    this.invitations.send(created, owner, created.invitedEmails ?? []);
+    return created;
   }
 
   /** Open rooms the caller owns or is invited to — strangers' rooms never list. */
@@ -195,7 +199,15 @@ export class RoomsService {
         `A room can have at most ${MAX_INVITES} invites`,
       );
     }
-    return this.persistUpdate(id, { invitedEmails });
+    const updated = await this.persistUpdate(id, { invitedEmails });
+    // Email only the people who weren't invited before.
+    const previously = new Set(room.invitedEmails ?? []);
+    this.invitations.send(
+      updated,
+      owner,
+      invitedEmails.filter((email) => !previously.has(email)),
+    );
+    return updated;
   }
 
   /**
@@ -346,7 +358,6 @@ export class RoomsService {
     });
   }
 
-  /** Manual "suggest a topic" — it spends LLM budget, so participants only. */
   /**
    * ICE servers for the caller's voice mesh in this room. Seat holders only: the
    * TURN credential lets its holder relay traffic through our server.
@@ -359,11 +370,20 @@ export class RoomsService {
     };
   }
 
+  /**
+   * Manual "suggest a topic": the host steers the conversation, so only the
+   * owner may ask (it also spends LLM budget). Everyone else gets the automatic
+   * volume/silence nudges.
+   */
   async suggestTopicFor(
     id: string,
     caller: RoomCaller,
   ): Promise<TopicSuggestion> {
-    await this.participantRoom(id, caller);
+    const room = await this.getRoom(id);
+    this.assertOwner(room, caller.uid);
+    if (room.status === 'ended') {
+      throw new ConflictException('Room has ended');
+    }
     return this.generateTopicSuggestion(id, 'manual');
   }
 

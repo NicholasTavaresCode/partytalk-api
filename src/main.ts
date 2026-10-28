@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import { AppConfig } from './config/configuration';
+import { PubSubIoAdapter } from './realtime/pubsub-io.adapter';
 import { setupSwagger } from './swagger';
 
 async function bootstrap(): Promise<void> {
@@ -38,6 +39,15 @@ async function bootstrap(): Promise<void> {
     origin: allowAnyOrigin ? true : corsOrigins,
     credentials: true,
   });
+
+  // Socket.IO rooms shared across instances via Pub/Sub when a topic is set.
+  app.useWebSocketAdapter(
+    new PubSubIoAdapter(
+      app,
+      config.get('realtime', { infer: true }).pubsubTopic,
+      config.get('gcp', { infer: true }).projectId,
+    ),
+  );
 
   // URI-based API versioning: /v1/...  (api-versioning).
   app.setGlobalPrefix('api');
@@ -94,6 +104,17 @@ async function bootstrap(): Promise<void> {
   if (env !== 'production' && !gcp.firestoreEmulatorHost) {
     logger.warn(
       `Using the REAL Firestore of ${gcp.projectId} from a ${env} build — set FIRESTORE_EMULATOR_HOST to keep local data out of it.`,
+    );
+  }
+
+  const realtime = config.get('realtime', { infer: true });
+  if (realtime.pubsubTopic) {
+    logger.log(
+      `Realtime: Socket.IO shared via Pub/Sub topic "${realtime.pubsubTopic}"`,
+    );
+  } else if (env === 'production') {
+    logger.warn(
+      'Realtime: in-memory Socket.IO adapter — sockets on different instances will not see each other. Set SOCKET_IO_PUBSUB_TOPIC.',
     );
   }
 

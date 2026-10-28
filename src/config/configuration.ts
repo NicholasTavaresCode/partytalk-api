@@ -55,6 +55,25 @@ export interface AppConfig {
     /** How many recent transcript segments to feed the model as context. */
     contextSegments: number;
   };
+  /** Outgoing email (room invitations). Off unless SMTP user + password are set. */
+  mail: {
+    smtpHost: string;
+    smtpPort: number;
+    smtpUser?: string;
+    smtpPassword?: string;
+    /** Sender shown to recipients, e.g. `PartyTalk <partytalk.hml@gmail.com>`. */
+    from?: string;
+    /** Public URL of the web app, for links in emails (no trailing slash). */
+    webAppUrl: string;
+  };
+  realtime: {
+    /**
+     * Pub/Sub topic that shares Socket.IO rooms and broadcasts across API
+     * instances. Unset = Socket.IO's in-memory adapter (one process only: fine
+     * locally, wrong on Cloud Run, which can run two instances at once).
+     */
+    pubsubTopic?: string;
+  };
   /** ICE servers handed to browsers for the P2P voice mesh. */
   webrtc: {
     /** Free STUN servers — enough for most home networks. */
@@ -109,6 +128,20 @@ export default (): AppConfig => ({
     ),
     silenceMs: parseInt(process.env.ROOM_SILENCE_MS ?? '25000', 10),
     contextSegments: parseInt(process.env.ROOM_CONTEXT_SEGMENTS ?? '25', 10),
+  },
+  mail: {
+    smtpHost: process.env.SMTP_HOST || 'smtp.gmail.com',
+    smtpPort: parseInt(process.env.SMTP_PORT || '465', 10),
+    smtpUser: process.env.SMTP_USER || undefined,
+    smtpPassword: process.env.SMTP_PASSWORD || undefined,
+    from: process.env.MAIL_FROM || undefined,
+    webAppUrl: (process.env.WEB_APP_URL || 'http://localhost:3000').replace(
+      /\/+$/,
+      '',
+    ),
+  },
+  realtime: {
+    pubsubTopic: process.env.SOCKET_IO_PUBSUB_TOPIC || undefined,
   },
   webrtc: {
     stunUrls: (process.env.STUN_URLS ?? 'stun:stun.l.google.com:19302')

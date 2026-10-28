@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { UsersModule } from '../users/users.module';
 import { FirestoreRoomsRepository } from './firestore-rooms.repository';
+import { RoomInvitations } from './room-invitations';
 import { RoomsController } from './rooms.controller';
 import { RoomsGateway } from './rooms.gateway';
 import { RoomsRepository } from './rooms.repository';
@@ -19,6 +20,7 @@ import { RoomsService } from './rooms.service';
   providers: [
     RoomsService,
     RoomsGateway,
+    RoomInvitations,
     { provide: RoomsRepository, useClass: FirestoreRoomsRepository },
   ],
   exports: [RoomsService],

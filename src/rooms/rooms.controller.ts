@@ -286,7 +286,7 @@ export class RoomsController {
   @ApiOperation({
     summary: 'Suggest a topic now (manual trigger)',
     description:
-      'Forces the AI facilitator to read the recent transcript and produce one new, related topic immediately — the same engine the automatic volume/silence triggers use. Only invited callers who have joined may trigger it (403 otherwise), since it spends AI budget. Returns 404 if the room does not exist.',
+      'Forces the AI facilitator to read the recent transcript and produce one new, related topic immediately — the same engine the automatic volume/silence triggers use — and pushes it to everyone in the room as a `topicSuggested` socket event. Owner-only (non-owners get 403): the host steers the conversation, and it spends AI budget. Returns 404 if the room does not exist, 409 if it has ended.',
   })
   @ApiParam(ROOM_ID_PARAM)
   @ApiEnvelopeResponse(TopicSuggestion, {
@@ -297,12 +297,21 @@ export class RoomsController {
     type: ErrorResponseDto,
     description: 'Room not found.',
   })
-  @ApiForbiddenResponse(NOT_INVITED_RESPONSE)
-  suggestTopic(
+  @ApiForbiddenResponse({
+    type: ErrorResponseDto,
+    description: 'Only the room owner may ask for a new topic.',
+  })
+  @ApiConflictResponse({
+    type: ErrorResponseDto,
+    description: 'The room has ended.',
+  })
+  async suggestTopic(
     @Param('id') id: string,
     @CurrentUser() user: AuthenticatedPrincipal,
   ): Promise<TopicSuggestion> {
-    return this.roomsService.suggestTopicFor(id, user);
+    const suggestion = await this.roomsService.suggestTopicFor(id, user);
+    this.roomsGateway.announceSuggestion(id, suggestion);
+    return suggestion;
   }
 
   @Get(':id/suggestions')

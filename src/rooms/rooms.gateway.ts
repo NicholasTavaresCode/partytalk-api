@@ -14,13 +14,21 @@ import { WsAuthenticator } from '../auth/ws-authenticator';
 import { AppConfig } from '../config/configuration';
 import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-principal.interface';
 import { RoomReport } from './entities/room-report.entity';
-import { SuggestionTrigger } from './entities/topic-suggestion.entity';
+import {
+  SuggestionTrigger,
+  TopicSuggestion,
+} from './entities/topic-suggestion.entity';
 import { shouldSuggestByVolume } from './facilitator/facilitator-policy';
 import { canAccessRoom, normalizeEmail } from './room-access';
 import { RoomsService } from './rooms.service';
 
 /** Mirrors PostTranscriptDto's limit for the REST path. */
 const MAX_SEGMENT_CHARS = 2000;
+
+/** Socket.IO room holding every socket in a room's voice mesh. */
+const voiceRoom = (roomId: string) => `voice:${roomId}`;
+/** Socket.IO room holding the one socket that speaks for `uid` in that mesh. */
+const voiceSeat = (roomId: string, uid: string) => `voice:${roomId}:${uid}`;
 
 interface JoinRoomPayload {
   roomId: string;
@@ -41,11 +49,15 @@ interface SignalPayload {
 
 /**
  * The authenticated user is attached to the socket at connection time; `rooms`
- * remembers which rooms it entered, because Socket.IO has already emptied
- * `socket.rooms` by the time `handleDisconnect` runs.
+ * and `voice` remember which rooms (and voice meshes) it entered, because
+ * Socket.IO has already emptied `socket.rooms` by the time `handleDisconnect` runs.
  */
 type AuthedSocket = Socket & {
-  data: { user?: AuthenticatedPrincipal; rooms?: Set<string> };
+  data: {
+    user?: AuthenticatedPrincipal;
+    rooms?: Set<string>;
+    voice?: Set<string>;
+  };
 };
 
 /** Per-room facilitator state kept in memory on this socket-server instance. */
@@ -71,9 +83,12 @@ interface RoomState {
  * in docs/audio-architecture.md (M1). Only tiny SDP/ICE messages pass through
  * here; audio flows browser-to-browser.
  *
- * NOTE: facilitator state and voice membership are in-process, so this assumes
- * a single socket-server instance (or sticky sessions). A multi-instance
- * deployment would move them into a shared store (e.g. Redis).
+ * Who is in a room or its voice mesh lives only in Socket.IO rooms, which the
+ * Pub/Sub adapter (PubSubIoAdapter) shares across instances — Cloud Run can run
+ * two at once even at max-instances 1. So presence, room updates and WebRTC
+ * relays reach sockets on any instance; never keep membership in a local Map.
+ * Only the facilitator's counters and silence timers stay per instance: while
+ * two instances overlap, a room's nudges may come from either.
  */
 @WebSocketGateway({ namespace: 'rooms', cors: true })
 export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
@@ -82,8 +97,6 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   private readonly logger = new Logger(RoomsGateway.name);
   private readonly rooms = new Map<string, RoomState>();
-  /** Voice mesh members per room: roomId → (uid → socket id). */
-  private readonly voice = new Map<string, Map<string, string>>();
   private readonly everySegments: number;
   private readonly silenceMs: number;
 
@@ -135,8 +148,8 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     if (!uid) {
       return;
     }
-    for (const roomId of [...this.voice.keys()]) {
-      this.leaveVoice(roomId, uid, client.id);
+    for (const roomId of client.data.voice ?? []) {
+      await this.announceVoiceLeftIfGone(roomId, uid);
     }
     for (const roomId of client.data.rooms ?? []) {
       await this.announceLeftIfGone(roomId, uid);
@@ -175,7 +188,7 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     @MessageBody() payload: JoinRoomPayload,
   ): Promise<void> {
     const user = this.requireUser(client);
-    this.leaveVoice(payload.roomId, user.uid, client.id);
+    await this.leaveVoice(client, payload.roomId, user.uid);
     await client.leave(payload.roomId);
     client.data.rooms?.delete(payload.roomId);
     await this.announceLeftIfGone(payload.roomId, user.uid);
@@ -227,8 +240,8 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
   }
 
   /**
-   * Enter the room's voice mesh. Replies with the peers already in it; the
-   * joiner sends each of them an offer, so there is never offer glare.
+   * Enter the room's voice mesh. Replies with the peers already in it, and the
+   * joiner offers to each of them.
    */
   @SubscribeMessage('webrtc:join')
   async handleWebrtcJoin(
@@ -236,17 +249,27 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     @MessageBody() payload: JoinRoomPayload,
   ): Promise<void> {
     const user = this.requireUser(client);
-    if (!(await this.mayEnter(client, user, payload.roomId))) {
+    const { roomId } = payload;
+    if (!(await this.mayEnter(client, user, roomId))) {
       return;
     }
 
-    let members = this.voice.get(payload.roomId);
-    if (!members) {
-      members = new Map();
-      this.voice.set(payload.roomId, members);
-    }
-    const uids = [...members.keys()].filter((uid) => uid !== user.uid);
-    members.set(user.uid, client.id);
+    // One voice connection per person: a newer tab or a reconnect takes the
+    // seat over, wherever the older socket lives, so offers never reach two.
+    const seat = voiceSeat(roomId, user.uid);
+    this.server
+      .in(seat)
+      .except(client.id)
+      .socketsLeave([voiceRoom(roomId), seat]);
+    // Join first, then list. When the host starts, everyone joins at once; this
+    // way two simultaneous joiners both see (and offer to) each other, and the
+    // client settles that glare (useVoiceMesh) — rather than each missing the
+    // other and nobody offering at all.
+    await client.join([voiceRoom(roomId), seat]);
+    (client.data.voice ??= new Set()).add(roomId);
+    const uids = (await this.uidsIn(voiceRoom(roomId))).filter(
+      (uid) => uid !== user.uid,
+    );
     client.emit('webrtc:peers', { uids });
   }
 
@@ -287,8 +310,18 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     email: string,
   ): Promise<void> {
     const target = normalizeEmail(email);
-    const sockets = await this.server.in(roomId).fetchSockets();
-    for (const socket of sockets) {
+    // Their sockets in the room channel or only in its voice mesh, on any instance.
+    const sockets = new Map<
+      string,
+      Awaited<ReturnType<typeof this.socketsIn>>[number]
+    >();
+    for (const room of [roomId, voiceRoom(roomId)]) {
+      for (const socket of await this.socketsIn(room)) {
+        sockets.set(socket.id, socket);
+      }
+    }
+    const evicted = new Set<string>();
+    for (const socket of sockets.values()) {
       const user = (socket.data as AuthedSocket['data']).user;
       if (
         !user ||
@@ -299,19 +332,16 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
         continue;
       }
       socket.leave(roomId);
-      (socket.data as AuthedSocket['data']).rooms?.delete(roomId);
-      this.leaveVoice(roomId, user.uid, socket.id);
+      socket.leave(voiceRoom(roomId));
+      socket.leave(voiceSeat(roomId, user.uid));
       socket.emit('removedFromRoom', { roomId });
-      this.server
-        .to(roomId)
-        .emit('presence', { roomId, uid: user.uid, event: 'left' });
+      evicted.add(user.uid);
     }
-    // Voice members who never subscribed to the room channel.
-    for (const uid of uids) {
-      const socketId = this.voice.get(roomId)?.get(uid);
-      if (socketId) {
-        this.leaveVoice(roomId, uid, socketId);
-      }
+    for (const uid of evicted) {
+      this.server
+        .to([roomId, voiceRoom(roomId)])
+        .emit('webrtc:peer-left', { uid });
+      this.server.to(roomId).emit('presence', { roomId, uid, event: 'left' });
     }
   }
 
@@ -326,12 +356,40 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     this.server.to(roomId).emit('roomUpdated', { roomId });
   }
 
+  /**
+   * The sockets in a Socket.IO room, across every instance. If another instance
+   * doesn't answer in time (e.g. Cloud Run is retiring it), fall back to this
+   * instance's view rather than failing the event.
+   */
+  private async socketsIn(room: string) {
+    try {
+      return await this.server.in(room).fetchSockets();
+    } catch (error) {
+      this.logger.warn(
+        `fetchSockets(${room}) across instances failed (${(error as Error).message}); using this instance only`,
+      );
+      return this.server.local.in(room).fetchSockets();
+    }
+  }
+
+  /** The distinct people (uids) with a socket in a Socket.IO room. */
+  private async uidsIn(room: string): Promise<string[]> {
+    const uids = new Set<string>();
+    for (const socket of await this.socketsIn(room)) {
+      const user = (socket.data as AuthedSocket['data']).user;
+      if (user) {
+        uids.add(user.uid);
+      }
+    }
+    return [...uids];
+  }
+
   /** Who is connected to the room right now, one entry per person. */
   private async membersOf(
     roomId: string,
   ): Promise<{ uid: string; name?: string }[]> {
     const members = new Map<string, string | undefined>();
-    for (const socket of await this.server.in(roomId).fetchSockets()) {
+    for (const socket of await this.socketsIn(roomId)) {
       const user = (socket.data as AuthedSocket['data']).user;
       if (user) {
         members.set(user.uid, user.name);
@@ -348,17 +406,31 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     this.server.to(roomId).emit('presence', { roomId, uid, event: 'left' });
   }
 
+  /**
+   * Broadcast a topic the host asked for (REST `suggest-topic`) to the whole
+   * room, and restart the automatic triggers so the AI doesn't pile another
+   * nudge on top of it.
+   */
+  announceSuggestion(roomId: string, suggestion: TopicSuggestion): void {
+    const state = this.rooms.get(roomId);
+    if (state) {
+      this.resetTriggers(state);
+    }
+    this.server.to(roomId).emit('topicSuggested', suggestion);
+  }
+
   /** Broadcast the end-of-session report and drop the room's timers/state. */
   broadcastSessionEnded(roomId: string, report?: RoomReport): void {
     this.clearRoomState(roomId);
-    this.voice.delete(roomId);
+    this.server.in(voiceRoom(roomId)).socketsLeave(voiceRoom(roomId));
     this.server.to(roomId).emit('sessionEnded', { roomId, report });
   }
 
   /**
-   * Forward a signaling message to one peer. Both ends must be current voice
-   * members of the room, and the sender is stamped from the verified socket —
-   * never from the payload. Membership is in memory, so relaying costs no I/O.
+   * Forward a signaling message to one peer's seat, on whichever instance it
+   * is. The sender must still hold its own seat in this room's mesh (a newer
+   * tab may have taken it over) and is stamped from the verified socket —
+   * never from the payload. Checking costs no I/O: it's the socket's own rooms.
    */
   private relay(
     client: AuthedSocket,
@@ -367,28 +439,43 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     body: Record<string, unknown>,
   ): void {
     const user = this.requireUser(client);
-    const members = this.voice.get(payload.roomId);
-    if (members?.get(user.uid) !== client.id) {
+    if (
+      typeof payload?.roomId !== 'string' ||
+      typeof payload.toUid !== 'string' ||
+      !client.rooms.has(voiceRoom(payload.roomId)) ||
+      !client.rooms.has(voiceSeat(payload.roomId, user.uid))
+    ) {
       return;
     }
-    const target = members.get(payload.toUid);
-    if (!target) {
-      return;
-    }
-    this.server.to(target).emit(event, { fromUid: user.uid, ...body });
+    this.server
+      .to(voiceSeat(payload.roomId, payload.toUid))
+      .emit(event, { fromUid: user.uid, ...body });
   }
 
-  private leaveVoice(roomId: string, uid: string, socketId: string): void {
-    const members = this.voice.get(roomId);
-    // A newer socket (e.g. a reconnect) may already own this uid's slot.
-    if (members?.get(uid) !== socketId) {
+  private async leaveVoice(
+    client: AuthedSocket,
+    roomId: string,
+    uid: string,
+  ): Promise<void> {
+    if (!client.data.voice?.delete(roomId)) {
       return;
     }
-    members.delete(uid);
-    if (members.size === 0) {
-      this.voice.delete(roomId);
+    await client.leave(voiceRoom(roomId));
+    await client.leave(voiceSeat(roomId, uid));
+    await this.announceVoiceLeftIfGone(roomId, uid);
+  }
+
+  /** Tell the mesh a peer left, unless they're still in it from another socket. */
+  private async announceVoiceLeftIfGone(
+    roomId: string,
+    uid: string,
+  ): Promise<void> {
+    if ((await this.uidsIn(voiceRoom(roomId))).includes(uid)) {
+      return;
     }
-    this.server.to(roomId).emit('webrtc:peer-left', { uid });
+    this.server
+      .to([roomId, voiceRoom(roomId)])
+      .emit('webrtc:peer-left', { uid });
   }
 
   /**
@@ -432,11 +519,7 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     }
     state.suggesting = true;
     // Reset counters up front so new segments accumulate toward the next nudge.
-    state.sinceLastSuggestion = 0;
-    if (state.silenceTimer) {
-      clearTimeout(state.silenceTimer);
-      state.silenceTimer = undefined;
-    }
+    this.resetTriggers(state);
 
     try {
       const suggestion = await this.roomsService.generateTopicSuggestion(
@@ -450,6 +533,14 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
       );
     } finally {
       state.suggesting = false;
+    }
+  }
+
+  private resetTriggers(state: RoomState): void {
+    state.sinceLastSuggestion = 0;
+    if (state.silenceTimer) {
+      clearTimeout(state.silenceTimer);
+      state.silenceTimer = undefined;
     }
   }
 

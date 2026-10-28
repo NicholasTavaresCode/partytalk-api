@@ -12,6 +12,7 @@ import { TranscriptSegment } from './entities/transcript-segment.entity';
 import { User } from '../users/entities/user.entity';
 import { UsersRepository } from '../users/users.repository';
 import { RoomCaller } from './room-access';
+import { RoomInvitations } from './room-invitations';
 import { RoomsRepository } from './rooms.repository';
 import { RoomsService } from './rooms.service';
 
@@ -91,6 +92,7 @@ describe('RoomsService', () => {
   let repo: InMemoryRoomsRepository;
   let users: InMemoryUsersRepository;
   let llm: { generate: jest.Mock };
+  let invitations: { send: jest.Mock };
 
   const OWNER = 'owner-1';
   const OWNER_CALLER: RoomCaller = { uid: OWNER, email: 'owner@example.com' };
@@ -99,11 +101,13 @@ describe('RoomsService', () => {
 
   beforeEach(async () => {
     llm = { generate: jest.fn() };
+    invitations = { send: jest.fn() };
     const moduleRef = await Test.createTestingModule({
       providers: [
         RoomsService,
         { provide: RoomsRepository, useClass: InMemoryRoomsRepository },
         { provide: UsersRepository, useClass: InMemoryUsersRepository },
+        { provide: RoomInvitations, useValue: invitations },
         { provide: LlmProvider, useValue: llm },
         {
           provide: ConfigService,
@@ -315,6 +319,50 @@ describe('RoomsService', () => {
     });
   });
 
+  describe('invitation emails', () => {
+    it('emails everyone invited when the room is created', async () => {
+      const room = await service.createRoom(OWNER_CALLER, {
+        topic: 'Plans',
+        invitedEmails: ['Bo@example.com', 'cy@example.com'],
+      });
+
+      expect(invitations.send).toHaveBeenCalledWith(
+        expect.objectContaining({ id: room.id }),
+        OWNER_CALLER,
+        ['bo@example.com', 'cy@example.com'],
+      );
+    });
+
+    it('emails only the newly added people', async () => {
+      const room = await service.createRoom(OWNER_CALLER, {
+        topic: 'Plans',
+        invitedEmails: [BO.email!],
+      });
+      invitations.send.mockClear();
+
+      await service.addInvites(room.id, OWNER_CALLER, [
+        'BO@example.com',
+        CY.email!,
+      ]);
+
+      expect(invitations.send).toHaveBeenCalledWith(
+        expect.objectContaining({ id: room.id }),
+        OWNER_CALLER,
+        [CY.email],
+      );
+    });
+
+    it('sends nothing when someone joins through the invite link', async () => {
+      const room = await service.createRoom(OWNER_CALLER, { topic: 'Plans' });
+      const { inviteCode } = await service.createInviteLink(room.id, OWNER);
+      invitations.send.mockClear();
+
+      await service.joinRoom(room.id, CY, inviteCode!);
+
+      expect(invitations.send).not.toHaveBeenCalled();
+    });
+  });
+
   describe('listRoomsFor', () => {
     it('lists only rooms the caller owns or is invited to', async () => {
       const mine = await service.createRoom(OWNER_CALLER, {
@@ -463,6 +511,46 @@ describe('RoomsService', () => {
       expect(suggestion.rationale).toBe('builds on surfing');
       expect(suggestion.trigger).toBe('volume');
       expect(await repo.listSuggestions(room.id, 10)).toHaveLength(1);
+    });
+  });
+
+  describe('suggestTopicFor (manual)', () => {
+    it('lets the owner ask for a topic', async () => {
+      const room = await createLiveRoom();
+      llm.generate.mockResolvedValue({
+        text: '{"topic":"Hidden talents","rationale":"fresh angle"}',
+      });
+
+      const suggestion = await service.suggestTopicFor(room.id, OWNER_CALLER);
+
+      expect(suggestion.topic).toBe('Hidden talents');
+      expect(suggestion.trigger).toBe('manual');
+    });
+
+    it('refuses a seated invitee — only the host steers', async () => {
+      const room = await service.createRoom(OWNER_CALLER, {
+        topic: 'Plans',
+        invitedEmails: [BO.email!],
+      });
+      await service.joinRoom(room.id, BO);
+      await service.startRoom(room.id, OWNER);
+
+      await expect(service.suggestTopicFor(room.id, BO)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(llm.generate).not.toHaveBeenCalled();
+    });
+
+    it('refuses once the room has ended', async () => {
+      const room = await createLiveRoom();
+      llm.generate.mockRejectedValue(new Error('no report'));
+      await service.endRoom(room.id, OWNER);
+      llm.generate.mockClear();
+
+      await expect(
+        service.suggestTopicFor(room.id, OWNER_CALLER),
+      ).rejects.toThrow(ConflictException);
+      expect(llm.generate).not.toHaveBeenCalled();
     });
   });
 

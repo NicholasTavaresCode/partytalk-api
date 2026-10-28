@@ -19,8 +19,15 @@
 #                                       runs and Cloud Logging stays empty
 #       roles/storage.objectUser        read the uploaded source (build)
 #       roles/artifactregistry.writer   push the image (build)
+#       roles/pubsub.editor             realtime: each instance creates (and deletes) its own
+#                                       subscription on $PUBSUB_TOPIC and publishes to it
+#     This script checks these before building and prints the grant commands if any is
+#     missing.
 #   - OAuth client (Google Auth Platform): $FRONTEND_URL in Authorized JavaScript
 #     origins; while the app is in "Testing", every tester in Audience → test users.
+#   - Invitation emails (optional): $MAIL_SENDER below, a Gmail account with 2-Step
+#     Verification, and its App Password in Secret Manager as PARTYTALK_SMTP_PASSWORD,
+#     readable by $SERVICE_ACCOUNT. Without both, invites still work; no email is sent.
 # The very first `--source` deploy creates the `cloud-run-source-deploy` image repository
 # the web deploy also pushes to — so the first time, deploy this API before the web.
 # After that the order does not matter: both URLs are deterministic, so each side is
@@ -58,6 +65,14 @@ GOOGLE_OAUTH_CLIENT_ID=484961620847-joi2l06qeuem1ocna1fnt4n907j8gp7g.apps.google
 # at boot. Comma-separated, case-insensitive.
 ALLOWED_AUTH_EMAILS="nicholasbalby@gmail.com,nicholasbalby@hotmail.com,jr21.nic@gmail.com"
 
+# Pub/Sub topic that shares Socket.IO rooms between instances (created below if missing).
+# Cloud Run can run two instances at once even at --max-instances 1; without this a host
+# on one never hears an invitee who landed on the other, and voice offers go nowhere.
+PUBSUB_TOPIC=partytalk-realtime
+
+# The dedicated Gmail account invitation emails are sent from. Empty = no emails.
+MAIL_SENDER=""
+
 # One flag with a custom '|' delimiter, because some values contain commas.
 ENV_VARS="^|^NODE_ENV=production"
 ENV_VARS+="|CORS_ORIGINS=$FRONTEND_URL"
@@ -84,20 +99,24 @@ ENV_VARS+="|LOG_LEVEL=info"
 # from the proxy and all users share ONE rate-limit budget (100 req/min): a single busy
 # tab, or a bot hitting this public URL, would 429 every tester.
 ENV_VARS+="|TRUST_PROXY_HOPS=1"
+ENV_VARS+="|SOCKET_IO_PUBSUB_TOPIC=$PUBSUB_TOPIC"
+# Links in invitation emails point at the web app.
+ENV_VARS+="|WEB_APP_URL=$FRONTEND_URL"
 # PORT is not set on purpose: Cloud Run reserves it and injects 8080, which main.ts reads.
 
 # Voice relay (optional). Wired automatically when a static address named `partytalk-turn`
 # exists in $REGION — a coturn server in `use-auth-secret` mode whose shared secret is in
 # Secret Manager as PARTYTALK_TURN_SECRET, readable by $SERVICE_ACCOUNT. Without it,
-# browsers get STUN only. Its shared secret is the only secret this API
-# holds: verifying Google ID tokens needs only the public client id, and every GCP call
-# authenticates as the service account. --quiet: never stop on an "enable API?" prompt.
+# browsers get STUN only. The only secrets this API holds are that one and the SMTP App
+# Password: verifying Google ID tokens needs only the public client id, and every GCP
+# call authenticates as the service account. --quiet: never stop on an "enable API?" prompt.
 TURN_IP=$(gcloud compute addresses describe partytalk-turn --region "$REGION" --project "$PROJECT_ID" \
   --format='value(address)' --quiet 2>/dev/null || true)
-EXTRA_FLAGS=()
+# All secrets go in ONE --set-secrets flag (a second flag would replace the first).
+SECRETS=()
 if [[ -n "$TURN_IP" ]]; then
   ENV_VARS+="|TURN_URLS=turn:${TURN_IP}:3478?transport=udp,turn:${TURN_IP}:3478?transport=tcp"
-  EXTRA_FLAGS+=(--set-secrets="TURN_SECRET=PARTYTALK_TURN_SECRET:latest")
+  SECRETS+=("TURN_SECRET=PARTYTALK_TURN_SECRET:latest")
 fi
 
 # Enable everything this deploy and the running service use, so gcloud never stops at an
@@ -109,11 +128,53 @@ REQUIRED_APIS=(
   artifactregistry.googleapis.com # stores the built image
   firestore.googleapis.com        # runtime: rooms, users, transcripts
   aiplatform.googleapis.com       # runtime: Gemini (AI host + reports)
-  secretmanager.googleapis.com    # runtime: TURN_SECRET, when a relay is configured
+  secretmanager.googleapis.com    # runtime: TURN_SECRET / SMTP_PASSWORD, when configured
+  pubsub.googleapis.com           # runtime: Socket.IO shared across instances
   logging.googleapis.com          # build and runtime logs
 )
 echo "Enabling required APIs…"
 gcloud services enable "${REQUIRED_APIS[@]}" --project "$PROJECT_ID"
+
+# The realtime topic: created here (idempotent) — each instance adds its own subscription.
+if ! gcloud pubsub topics describe "$PUBSUB_TOPIC" --project "$PROJECT_ID" --quiet >/dev/null 2>&1; then
+  echo "Creating Pub/Sub topic $PUBSUB_TOPIC…"
+  gcloud pubsub topics create "$PUBSUB_TOPIC" --project "$PROJECT_ID"
+fi
+
+# The service account's roles are granted by hand (see the top). A missing one doesn't
+# fail the deploy — it fails at runtime, often quietly (no logs, no realtime) — so check.
+REQUIRED_ROLES=(roles/datastore.user roles/aiplatform.user roles/logging.logWriter
+  roles/storage.objectUser roles/artifactregistry.writer roles/pubsub.editor)
+GRANTED=$(gcloud projects get-iam-policy "$PROJECT_ID" --flatten="bindings[].members" \
+  --filter="bindings.members:serviceAccount:$SERVICE_ACCOUNT" --format="value(bindings.role)")
+MISSING=()
+for role in "${REQUIRED_ROLES[@]}"; do
+  grep -qx "$role" <<<"$GRANTED" || MISSING+=("$role")
+done
+if (( ${#MISSING[@]} )); then
+  echo "$SERVICE_ACCOUNT is missing: ${MISSING[*]}. Grant, wait a minute, then re-run:"
+  for role in "${MISSING[@]}"; do
+    echo "  gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$SERVICE_ACCOUNT --role=$role --condition=None --quiet"
+  done
+  exit 1
+fi
+
+# Invitation emails: on when a sender is set and its App Password is in Secret Manager.
+MAIL_STATUS="off (no MAIL_SENDER)"
+if [[ -n "$MAIL_SENDER" ]]; then
+  if gcloud secrets describe PARTYTALK_SMTP_PASSWORD --project "$PROJECT_ID" --quiet >/dev/null 2>&1; then
+    ENV_VARS+="|SMTP_HOST=smtp.gmail.com|SMTP_PORT=465|SMTP_USER=$MAIL_SENDER"
+    ENV_VARS+="|MAIL_FROM=PartyTalk <$MAIL_SENDER>"
+    SECRETS+=("SMTP_PASSWORD=PARTYTALK_SMTP_PASSWORD:latest")
+    MAIL_STATUS="on, from $MAIL_SENDER"
+  else
+    MAIL_STATUS="off (secret PARTYTALK_SMTP_PASSWORD not found)"
+  fi
+fi
+EXTRA_FLAGS=()
+if (( ${#SECRETS[@]} )); then
+  EXTRA_FLAGS+=(--set-secrets="$(IFS=,; echo "${SECRETS[*]}")")
+fi
 
 # The Firestore database is created by hand in the console (see the top).
 # Without it the service would deploy, pass its liveness probe, and then fail every room
@@ -137,11 +198,11 @@ fi
 
 echo "Deploying $SERVICE_NAME to $PROJECT_ID/$REGION — the build takes a few minutes."
 
-# --max-instances 1 is NOT a capacity choice. The facilitator's per-room counters and
-# silence timers, and the voice mesh's signaling membership, live in this process. A
-# second instance would split a room's sockets between processes: peers on different
-# instances could never relay WebRTC offers to each other, and each would run its own
-# topic triggers. Raising it needs a shared store (Redis) first.
+# --min-instances 1 / --max-instances 1: one warm instance. Membership, presence and voice
+# relays are shared across instances through Pub/Sub, so the overlap Cloud Run creates
+# when it replaces an instance is harmless — but the AI facilitator's counters and silence
+# timers are still per instance, and a warm instance avoids the cold start (and the
+# instance churn) that scale-to-zero causes. Costs one idle instance (~US$5–10/month).
 #
 # --timeout 3600: a WebSocket is one long-lived request to Cloud Run, so the request
 # timeout is the socket's lifetime. At 60s every client would be cut off each minute (and
@@ -158,8 +219,8 @@ echo "Deploying $SERVICE_NAME to $PROJECT_ID/$REGION — the build takes a few m
 # --allow-unauthenticated is deliberate: browsers call this directly, and every route
 # except the health probes is authenticated in-app by GoogleAuthGuard + the allow-list.
 #
-# --cpu-boost: full CPU during startup, so a cold start (min-instances 0) serves its first
-# request — usually someone opening a room — faster.
+# --cpu-boost: full CPU during startup, so a replacement instance serves its first request
+# — usually someone opening a room — faster.
 gcloud run deploy "$SERVICE_NAME" \
   --source . \
   --region "$REGION" \
@@ -167,7 +228,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --service-account "$SERVICE_ACCOUNT" \
   --build-service-account "projects/$PROJECT_ID/serviceAccounts/$SERVICE_ACCOUNT" \
   --allow-unauthenticated \
-  --min-instances 0 \
+  --min-instances 1 \
   --max-instances 1 \
   --session-affinity \
   --concurrency 200 \
@@ -185,6 +246,8 @@ if [[ -n "$TURN_IP" ]]; then
 else
   echo "Voice:   STUN only (no partytalk-turn relay address in $REGION)"
 fi
+echo "Realtime: Socket.IO shared via Pub/Sub topic $PUBSUB_TOPIC"
+echo "Email:   $MAIL_STATUS"
 echo "Health:  curl $SELF_URL/api/v1/health/ready"
 echo "Swagger: $SELF_URL/docs"
 echo "Logs:    gcloud run services logs tail $SERVICE_NAME --region $REGION --project $PROJECT_ID"

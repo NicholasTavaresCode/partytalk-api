@@ -55,7 +55,7 @@ Sockets reuse the same `AuthService` through [WsAuthenticator](src/auth/ws-authe
 
 Being signed in is not enough to touch a room. The single rule is `canAccessRoom` in [rooms/room-access.ts](src/rooms/room-access.ts): the **owner**, or a caller whose Google-verified email is in `room.invitedEmails` (lowercased). Rooms without the field (pre-invite data) are owner-only. Don't add checks elsewhere — route new room operations through the service helpers:
 
-- `accessibleRoom` (owner/invitee, else 403) for reads; `participantRoom` (also must have joined) for writes that cost or mutate — REST transcript, manual `suggest-topic`; `assertOwner` for lifecycle and invite management.
+- `accessibleRoom` (owner/invitee, else 403) for reads; `participantRoom` (also must have joined) for writes that cost or mutate — REST transcript, ICE servers; `assertOwner` for lifecycle, invite management and the manual `suggest-topic` (only the host steers; the controller broadcasts the result as `topicSuggested` via `RoomsGateway.announceSuggestion`, which also restarts the auto-triggers).
 - `viewFor` strips `invitedEmails` and `inviteCode` from every room returned to a non-owner. `getRoom` is the unfiltered lookup for trusted server code only (the gateway).
 - `GET /rooms` lists only rooms you own or are invited to (`listOpenForMember`: two single-field Firestore queries merged in memory, so no composite index).
 - **Invite link:** `inviteCode` (128-bit, compared in constant time) is minted/rotated by `POST :id/invite-link` and nulled by `DELETE`. `POST :id/join { inviteCode }` admits a non-invitee **and appends their email to `invitedEmails`**, so link joiners are durable, visible and revocable like any invitee.
@@ -69,7 +69,14 @@ Being signed in is not enough to touch a room. The single rule is `canAccessRoom
 
 **Keep the transcript hot path free of I/O before the broadcast.** `transcript` is authorized by `client.rooms.has(roomId)` (sockets only enter a room after `joinRoom`'s participant check), built with `buildTranscriptSegment`, broadcast, and only *then* persisted with `saveTranscriptSegment` — the write must still finish before the facilitator triggers run, since they read history from the repository. The REST `POST /rooms/:id/transcript` path uses `addTranscriptSegment` (existence check + write).
 
-**Voice signaling** (M1 of [docs/audio-architecture.md](docs/audio-architecture.md)): in `webrtc:join` (participant-checked; replies `webrtc:peers { uids }` with members already in the mesh — the joiner offers to each, so no glare), `webrtc:offer|answer|ice { roomId, toUid, … }`; out `webrtc:peer-offer|peer-answer|peer-ice { fromUid, … }` to the target socket only, and `webrtc:peer-left { uid }` to the room on leave/disconnect. Relays check in-memory membership only and stamp `fromUid` from the socket.
+**Multiple instances.** Cloud Run can run two API instances at once even at `--max-instances 1`: it starts a replacement while the old one still holds open WebSockets. So Socket.IO uses the Google Cloud Pub/Sub adapter ([realtime/pubsub-io.adapter.ts](src/realtime/pubsub-io.adapter.ts), enabled by `SOCKET_IO_PUBSUB_TOPIC`). Room membership lives **only in Socket.IO rooms**, which the adapter shares across instances. `server.to(...).emit`, `fetchSockets` and `socketsLeave` therefore reach every instance. **Never keep membership in a local `Map`.** Cross-instance `fetchSockets` goes through `socketsIn`, which falls back to `server.local` if another instance doesn't answer. Without a topic (local dev, tests), Socket.IO keeps its in-memory adapter.
+
+**Voice signaling** (M1 of [docs/audio-architecture.md](docs/audio-architecture.md)):
+- **Client→server:** `webrtc:join` (participant-checked), and `webrtc:offer|answer|ice { roomId, toUid, … }`.
+- **Server→client:** `webrtc:peers { uids }` to the joiner, `webrtc:peer-offer|peer-answer|peer-ice { fromUid, … }` to the target only, and `webrtc:peer-left { uid }` when someone's last voice socket leaves.
+- **Membership:** a voice member is in two Socket.IO rooms, `voice:{roomId}` (the mesh) and `voice:{roomId}:{uid}` (their seat). A newer tab or reconnect takes the seat over through `socketsLeave`.
+- **Relaying:** a relay emits to the target's seat on any instance. It checks only the sender's own rooms and stamps `fromUid` from the socket.
+- **Joining:** `webrtc:join` joins *before* listing peers. When the host starts, everyone joins at once and two joiners can offer each other; the client breaks that glare (the lower uid keeps its offer).
 
 **ICE servers** come from `GET /rooms/:id/ice-servers` (seated participants only): STUN, plus a TURN relay when `TURN_URLS` **and** `TURN_SECRET` are set, with a per-user credential minted by [rooms/ice-servers.ts](src/rooms/ice-servers.ts) in coturn's `use-auth-secret` scheme (`username = "<expiry>:<uid>"`, `credential = base64(HMAC-SHA1(secret, username))`, TTL `TURN_CREDENTIAL_TTL_SECONDS`). Nothing is stored; the relay verifies with the shared secret. In HML, `deploy-hml.sh` wires a relay automatically when a `partytalk-turn` static address exists (the secret comes from Secret Manager `PARTYTALK_TURN_SECRET`).
 
@@ -87,7 +94,8 @@ Unit tests (`*.spec.ts` beside source) mock external services through the reposi
 
 ## Known constraints / next steps
 
-- Facilitator per-room state (segment counters, silence timers) and voice-mesh membership are **in-process** — assumes a single socket-server instance or sticky sessions. Multi-instance deploy needs shared state (e.g. Redis).
+- The facilitator's per-room counters and silence timers are still **per instance**. While Cloud Run overlaps two instances, a room's nudges may come from either. HML runs `--min-instances 1 --max-instances 1` to keep that rare.
+- **Invitation emails** go through the `Mailer` abstraction ([mail/](src/mail/); `SmtpMailer` is a dedicated Gmail account in HML) from `RoomInvitations`. They are fire-and-forget: sent on create and on add (new addresses only), never on link joins, and a failure never fails the invite. Without `SMTP_USER` and `SMTP_PASSWORD` it only logs.
 - IELTS is parked; exam content is served from Firestore, seed scripts not yet included.
 
 ## Conventions

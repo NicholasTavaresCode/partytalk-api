@@ -12,6 +12,8 @@ export const MAX_INVITES = 50;
 export interface RoomCaller {
   uid: string;
   email?: string;
+  /** Display name — only used to say who invited someone. */
+  name?: string;
 }
 
 export function normalizeEmail(email: string): string {
