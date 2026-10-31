@@ -1,0 +1,10 @@
+# Local `docker build` / `docker compose build` context — mirrors .gcloudignore so a
+# local image is built exactly like Cloud Build's. Host node_modules must never reach
+# `COPY . .`: they would overwrite the Alpine-installed ones (glibc native binaries).
+node_modules
+dist
+coverage
+.env
+.env.*
+!.env.example
+.git

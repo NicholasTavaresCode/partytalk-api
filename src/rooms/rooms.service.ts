@@ -25,6 +25,19 @@ import {
   parseOpeningTopic,
   parseReport,
 } from './facilitator/facilitator-prompts';
+import { User } from '../users/entities/user.entity';
+import { UsersRepository } from '../users/users.repository';
+import {
+  canAccessRoom,
+  inviteCodeMatches,
+  MAX_INVITES,
+  newInviteCode,
+  normalizeEmail,
+  normalizeInvites,
+  RoomCaller,
+} from './room-access';
+import { buildIceServers } from './ice-servers';
+import { RoomInvitations } from './room-invitations';
 import { RoomsRepository } from './rooms.repository';
 
 const DEFAULT_MAX_PARTICIPANTS = 5;
@@ -48,6 +61,10 @@ export interface Speaker {
  * has a fixed session length: the gateway's clock calls `expireRoom` when it
  * runs out, and either way the host writes a single room-level report on end.
  *
+ * Rooms are invite-only: every caller-facing method enforces `canAccessRoom`
+ * (owner + invited emails), writes additionally require having joined, and
+ * the invite list / link secret are stripped from what non-owners see.
+ *
  * The AI is reached only through the provider-agnostic LlmProvider, and all
  * persistence goes through RoomsRepository — this service never touches
  * Firestore (arch-single-responsibility, arch-use-repository-pattern).
@@ -56,13 +73,17 @@ export interface Speaker {
 export class RoomsService {
   private readonly logger = new Logger(RoomsService.name);
   private readonly facilitator: AppConfig['facilitator'];
+  private readonly webrtc: AppConfig['webrtc'];
 
   constructor(
     private readonly roomsRepository: RoomsRepository,
+    private readonly usersRepository: UsersRepository,
+    private readonly invitations: RoomInvitations,
     private readonly llm: LlmProvider,
     config: ConfigService<AppConfig, true>,
   ) {
     this.facilitator = config.get('facilitator', { infer: true });
+    this.webrtc = config.get('webrtc', { infer: true });
   }
 
   /**
@@ -84,14 +105,16 @@ export class RoomsService {
       topic,
       topicPickedByHost,
       status: 'waiting',
-      ownerId,
-      participantIds: [ownerId],
+      ownerId: owner.uid,
+      participantIds: [owner.uid],
       maxParticipants: dto.maxParticipants ?? DEFAULT_MAX_PARTICIPANTS,
       durationMinutes: dto.durationMinutes ?? DEFAULT_ROOM_DURATION_MINUTES,
       createdAt: now,
       updatedAt: now,
     };
-    return this.roomsRepository.create(room);
+    const created = await this.roomsRepository.create(room);
+    this.invitations.send(created, owner, created.invitedEmails ?? []);
+    return created;
   }
 
   /**
@@ -125,6 +148,10 @@ export class RoomsService {
     return this.roomsRepository.listOpen(limit);
   }
 
+  /**
+   * Unfiltered lookup for trusted server-side callers (the gateway). Anything
+   * answering a user goes through `getRoomFor` instead.
+   */
   async getRoom(id: string): Promise<Room> {
     const room = await this.roomsRepository.findById(id);
     if (!room) {
@@ -133,30 +160,138 @@ export class RoomsService {
     return room;
   }
 
-  async joinRoom(id: string, uid: string): Promise<Room> {
+  async getRoomFor(id: string, caller: RoomCaller): Promise<Room> {
+    return this.viewFor(await this.accessibleRoom(id, caller), caller.uid);
+  }
+
+  /**
+   * Take a seat. Invitees (and the owner) just join; anyone else must present
+   * the room's current invite-link code, which adds their verified email to the
+   * invite list so they keep access — and the owner can see and revoke them.
+   */
+  async joinRoom(
+    id: string,
+    caller: RoomCaller,
+    inviteCode?: string,
+  ): Promise<Room> {
     const room = await this.getRoom(id);
+    const viaLink = !canAccessRoom(room, caller);
+    if (
+      viaLink &&
+      !(caller.email && inviteCodeMatches(room.inviteCode, inviteCode))
+    ) {
+      throw new ForbiddenException(NOT_INVITED);
+    }
 
     if (room.status === 'ended') {
       throw new ConflictException('Room has ended');
     }
     // Idempotent: re-joining is a no-op rather than an error.
-    if (room.participantIds.includes(uid)) {
-      return room;
+    if (room.participantIds.includes(caller.uid)) {
+      return this.viewFor(room, caller.uid);
     }
     if (room.participantIds.length >= room.maxParticipants) {
       throw new ConflictException('Room is full');
     }
 
-    return this.persistUpdate(id, {
-      participantIds: [...room.participantIds, uid],
-    });
+    const changes: Partial<Room> = {
+      participantIds: [...room.participantIds, caller.uid],
+    };
+    if (viaLink) {
+      const invitedEmails = normalizeInvites([
+        ...(room.invitedEmails ?? []),
+        caller.email!,
+      ]);
+      if (invitedEmails.length > MAX_INVITES) {
+        throw new ConflictException('This room’s invite list is full');
+      }
+      changes.invitedEmails = invitedEmails;
+    }
+    return this.viewFor(await this.persistUpdate(id, changes), caller.uid);
   }
 
-  async leaveRoom(id: string, uid: string): Promise<Room> {
-    const room = await this.getRoom(id);
-    return this.persistUpdate(id, {
-      participantIds: room.participantIds.filter((p) => p !== uid),
+  async leaveRoom(id: string, caller: RoomCaller): Promise<Room> {
+    const room = await this.accessibleRoom(id, caller);
+    const updated = await this.persistUpdate(id, {
+      participantIds: room.participantIds.filter((p) => p !== caller.uid),
     });
+    return this.viewFor(updated, caller.uid);
+  }
+
+  /** Owner adds people to the invite list (already-invited ones are ignored). */
+  async addInvites(
+    id: string,
+    owner: RoomCaller,
+    emails: string[],
+  ): Promise<Room> {
+    const room = await this.getRoom(id);
+    this.assertOwner(room, owner.uid);
+    const invitedEmails = normalizeInvites(
+      [...(room.invitedEmails ?? []), ...emails],
+      owner.email,
+    );
+    if (invitedEmails.length > MAX_INVITES) {
+      throw new BadRequestException(
+        `A room can have at most ${MAX_INVITES} invites`,
+      );
+    }
+    const updated = await this.persistUpdate(id, { invitedEmails });
+    // Email only the people who weren't invited before.
+    const previously = new Set(room.invitedEmails ?? []);
+    this.invitations.send(
+      updated,
+      owner,
+      invitedEmails.filter((email) => !previously.has(email)),
+    );
+    return updated;
+  }
+
+  /**
+   * Owner revokes an invite. Whoever signed in with that address also loses
+   * their seat, so a revoked person can't keep listening; `removedUids` lets
+   * the caller evict their live sockets. Idempotent.
+   */
+  async revokeInvite(
+    id: string,
+    ownerUid: string,
+    email: string,
+  ): Promise<{ room: Room; removedUids: string[] }> {
+    const room = await this.getRoom(id);
+    this.assertOwner(room, ownerUid);
+    const target = normalizeEmail(email);
+
+    // participantIds are uids, so resolve them to emails to find the seat.
+    const members = await Promise.all(
+      room.participantIds
+        .filter((uid) => uid !== room.ownerId)
+        .map((uid) => this.usersRepository.findById(uid)),
+    );
+    const removedUids = members
+      .filter(
+        (user): user is User => !!user && normalizeEmail(user.email) === target,
+      )
+      .map((user) => user.id);
+
+    const updated = await this.persistUpdate(id, {
+      invitedEmails: (room.invitedEmails ?? []).filter((e) => e !== target),
+      participantIds: room.participantIds.filter(
+        (uid) => !removedUids.includes(uid),
+      ),
+    });
+    return { room: updated, removedUids };
+  }
+
+  /** Mint (or rotate) the invite-link code; a rotation kills links already shared. */
+  async createInviteLink(id: string, ownerUid: string): Promise<Room> {
+    const room = await this.getRoom(id);
+    this.assertOwner(room, ownerUid);
+    return this.persistUpdate(id, { inviteCode: newInviteCode() });
+  }
+
+  async disableInviteLink(id: string, ownerUid: string): Promise<Room> {
+    const room = await this.getRoom(id);
+    this.assertOwner(room, ownerUid);
+    return this.persistUpdate(id, { inviteCode: null });
   }
 
   /**
@@ -228,19 +363,39 @@ export class RoomsService {
   /** Ingest one voice-transcript segment (from client-side speech-to-text). */
   async addTranscriptSegment(
     id: string,
-    speaker: Speaker,
+    speaker: Speaker & RoomCaller,
     text: string,
   ): Promise<TranscriptSegment> {
-    // Ensure the room exists before persisting.
-    await this.getRoom(id);
-    return this.roomsRepository.addSegment({
+    await this.participantRoom(id, speaker);
+    return this.saveTranscriptSegment(
+      this.buildTranscriptSegment(id, speaker, text),
+    );
+  }
+
+  /**
+   * Stamp a segment without touching storage, so the realtime gateway can fan
+   * it out at socket latency and persist it afterwards via
+   * `saveTranscriptSegment`. Callers are responsible for authorizing the room.
+   */
+  buildTranscriptSegment(
+    roomId: string,
+    speaker: Speaker,
+    text: string,
+  ): TranscriptSegment {
+    return {
       id: crypto.randomUUID(),
-      roomId: id,
+      roomId,
       speakerId: speaker.uid,
       speakerName: speaker.name,
       text,
       at: new Date().toISOString(),
-    });
+    };
+  }
+
+  saveTranscriptSegment(
+    segment: TranscriptSegment,
+  ): Promise<TranscriptSegment> {
+    return this.roomsRepository.addSegment(segment);
   }
 
   /**
@@ -306,7 +461,41 @@ export class RoomsService {
     });
   }
 
-  listTranscript(id: string, limit: number): Promise<TranscriptSegment[]> {
+  /**
+   * ICE servers for the caller's voice mesh in this room. Seat holders only: the
+   * TURN credential lets its holder relay traffic through our server.
+   */
+  async iceServersFor(id: string, caller: RoomCaller): Promise<IceServers> {
+    await this.participantRoom(id, caller);
+    return {
+      iceServers: buildIceServers(this.webrtc, caller.uid, Date.now()),
+      ttlSeconds: this.webrtc.turnCredentialTtlSeconds,
+    };
+  }
+
+  /**
+   * Manual "suggest a topic": the host steers the conversation, so only the
+   * owner may ask (it also spends LLM budget). Everyone else gets the automatic
+   * volume/silence nudges.
+   */
+  async suggestTopicFor(
+    id: string,
+    caller: RoomCaller,
+  ): Promise<TopicSuggestion> {
+    const room = await this.getRoom(id);
+    this.assertOwner(room, caller.uid);
+    if (room.status === 'ended') {
+      throw new ConflictException('Room has ended');
+    }
+    return this.generateTopicSuggestion(id, 'manual');
+  }
+
+  async listTranscript(
+    id: string,
+    caller: RoomCaller,
+    limit: number,
+  ): Promise<TranscriptSegment[]> {
+    await this.accessibleRoom(id, caller);
     return this.roomsRepository.listSegments(id, limit);
   }
 
@@ -323,6 +512,35 @@ export class RoomsService {
       buildReportPrompt({ seedTopic: room.topic, transcript, hostMessages }),
     );
     return { ...parseReport(text), generatedAt: new Date().toISOString() };
+  }
+
+  /** The room, if the caller may see it (owner or invitee); 403 otherwise. */
+  private async accessibleRoom(id: string, caller: RoomCaller): Promise<Room> {
+    const room = await this.getRoom(id);
+    if (!canAccessRoom(room, caller)) {
+      throw new ForbiddenException(NOT_INVITED);
+    }
+    return room;
+  }
+
+  /** The room, if the caller may see it *and* has taken a seat in it. */
+  private async participantRoom(id: string, caller: RoomCaller): Promise<Room> {
+    const room = await this.accessibleRoom(id, caller);
+    if (!room.participantIds.includes(caller.uid)) {
+      throw new ForbiddenException('Join the room first');
+    }
+    return room;
+  }
+
+  /** Owner-only fields (invite list, link secret) are hidden from everyone else. */
+  private viewFor(room: Room, uid: string): Room {
+    if (room.ownerId === uid) {
+      return room;
+    }
+    const view = { ...room };
+    delete view.invitedEmails;
+    delete view.inviteCode;
+    return view;
   }
 
   private assertOwner(room: Room, requesterUid: string): void {

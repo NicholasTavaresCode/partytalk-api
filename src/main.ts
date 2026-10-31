@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import { AppConfig } from './config/configuration';
+import { PubSubIoAdapter } from './realtime/pubsub-io.adapter';
 import { setupSwagger } from './swagger';
 
 async function bootstrap(): Promise<void> {
@@ -17,6 +18,14 @@ async function bootstrap(): Promise<void> {
   app.useLogger(app.get(Logger));
 
   const config = app.get(ConfigService<AppConfig, true>);
+
+  // Behind Cloud Run every request arrives from its front end, so without this
+  // `req.ip` — the ThrottlerGuard's key — is one shared proxy address and all
+  // users share a single rate-limit budget.
+  const trustProxyHops = config.get('trustProxyHops', { infer: true });
+  if (trustProxyHops > 0) {
+    app.set('trust proxy', trustProxyHops);
+  }
 
   // Security headers (security-sanitize-output) + tight CORS.
   app.use(helmet());
@@ -30,6 +39,15 @@ async function bootstrap(): Promise<void> {
     origin: allowAnyOrigin ? true : corsOrigins,
     credentials: true,
   });
+
+  // Socket.IO rooms shared across instances via Pub/Sub when a topic is set.
+  app.useWebSocketAdapter(
+    new PubSubIoAdapter(
+      app,
+      config.get('realtime', { infer: true }).pubsubTopic,
+      config.get('gcp', { infer: true }).projectId,
+    ),
+  );
 
   // URI-based API versioning: /v1/...  (api-versioning).
   app.setGlobalPrefix('api');
@@ -69,7 +87,45 @@ async function bootstrap(): Promise<void> {
       `Auth: Google Identity — expected client id (aud): ${auth.googleOAuthClientId || '(UNSET!)'}`,
     );
     logger.log(
-      `Auth domain allow-list: ${auth.allowedAuthDomains.join(', ') || '(open sign-up — any verified Google account)'}`,
+      auth.allowedAuthDomains.length || auth.allowedAuthEmails.length
+        ? `Auth allow-list: ${auth.allowedAuthEmails.length} email(s), domains: ${auth.allowedAuthDomains.join(', ') || '(none)'}`
+        : 'Auth allow-list: (open sign-up — any verified Google account)',
+    );
+  }
+
+  const gcp = config.get('gcp', { infer: true });
+  logger.log(
+    `Firestore: database "${gcp.firestoreDatabaseId}" ${
+      gcp.firestoreEmulatorHost
+        ? `on the emulator at ${gcp.firestoreEmulatorHost}`
+        : `in project ${gcp.projectId}`
+    }`,
+  );
+  if (env !== 'production' && !gcp.firestoreEmulatorHost) {
+    logger.warn(
+      `Using the REAL Firestore of ${gcp.projectId} from a ${env} build — set FIRESTORE_EMULATOR_HOST to keep local data out of it.`,
+    );
+  }
+
+  const realtime = config.get('realtime', { infer: true });
+  if (realtime.pubsubTopic) {
+    logger.log(
+      `Realtime: Socket.IO shared via Pub/Sub topic "${realtime.pubsubTopic}"`,
+    );
+  } else if (env === 'production') {
+    logger.warn(
+      'Realtime: in-memory Socket.IO adapter — sockets on different instances will not see each other. Set SOCKET_IO_PUBSUB_TOPIC.',
+    );
+  }
+
+  const webrtc = config.get('webrtc', { infer: true });
+  if (webrtc.turnUrls.length && !webrtc.turnSecret) {
+    logger.warn(
+      'TURN_URLS is set but TURN_SECRET is not — the voice relay is OFF (STUN only).',
+    );
+  } else {
+    logger.log(
+      `Voice ICE: STUN${webrtc.turnSecret && webrtc.turnUrls.length ? ` + TURN relay (${webrtc.turnUrls.join(', ')})` : ' only — no relay for strict NATs'}`,
     );
   }
 }

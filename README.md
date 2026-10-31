@@ -74,7 +74,7 @@ npm run start:dev         # watch mode
 npm run start:prod        # from built dist/
 ```
 
-The API is served under `/api/v1`. Health probes: `GET /api/v1/health/live`, `GET /api/v1/health/ready`.
+The API listens on `PORT` (8080 in `.env.example`) and is served under `/api/v1`. Health probes: `GET /api/v1/health/live`, `GET /api/v1/health/ready`.
 
 ### Interactive API docs (Swagger / OpenAPI)
 

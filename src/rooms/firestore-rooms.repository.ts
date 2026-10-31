@@ -63,13 +63,29 @@ export class FirestoreRoomsRepository extends RoomsRepository {
     await this.collection.doc(id).delete();
   }
 
-  async listOpen(limit: number): Promise<Room[]> {
-    const snapshot = await this.collection
-      .where('status', 'in', OPEN_STATUSES)
-      .orderBy('createdAt', 'desc')
-      .limit(limit)
-      .get();
-    return snapshot.docs.map((doc) => doc.data() as Room);
+  async listOpenForMember(
+    uid: string,
+    email: string | undefined,
+    limit: number,
+  ): Promise<Room[]> {
+    // Two single-field queries (no composite index needed), merged in memory.
+    // A user's rooms + invitations are few, so the status filter is cheap here.
+    const queries = [this.collection.where('ownerId', '==', uid).get()];
+    if (email) {
+      queries.push(
+        this.collection.where('invitedEmails', 'array-contains', email).get(),
+      );
+    }
+    const byId = new Map<string, Room>();
+    for (const snapshot of await Promise.all(queries)) {
+      for (const doc of snapshot.docs) {
+        byId.set(doc.id, doc.data() as Room);
+      }
+    }
+    return [...byId.values()]
+      .filter((room) => OPEN_STATUSES.includes(room.status))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit);
   }
 
   async addSegment(segment: TranscriptSegment): Promise<TranscriptSegment> {
@@ -81,11 +97,14 @@ export class FirestoreRoomsRepository extends RoomsRepository {
     roomId: string,
     limit: number,
   ): Promise<TranscriptSegment[]> {
+    // Newest `limit` first from Firestore, then flipped back to chronological.
     const snapshot = await this.segmentsCollection(roomId)
-      .orderBy('at')
+      .orderBy('at', 'desc')
       .limit(limit)
       .get();
-    return snapshot.docs.map((doc) => doc.data() as TranscriptSegment);
+    return snapshot.docs
+      .map((doc) => doc.data() as TranscriptSegment)
+      .reverse();
   }
 
   async listRecentSegments(

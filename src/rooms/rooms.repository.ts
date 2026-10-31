@@ -17,8 +17,15 @@ export abstract class RoomsRepository {
   ): Promise<Room | null>;
   abstract delete(id: string): Promise<void>;
 
-  /** Rooms still open to join (status `waiting` or `live`), newest first. */
-  abstract listOpen(limit: number): Promise<Room[]>;
+  /**
+   * Open rooms (status `waiting` or `live`) the user owns or whose invite list
+   * holds `email` (already normalized), newest first.
+   */
+  abstract listOpenForMember(
+    uid: string,
+    email: string | undefined,
+    limit: number,
+  ): Promise<Room[]>;
 
   abstract addSegment(segment: TranscriptSegment): Promise<TranscriptSegment>;
 

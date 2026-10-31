@@ -7,10 +7,19 @@ export interface AppConfig {
   env: string;
   port: number;
   corsOrigins: string[];
+  /**
+   * Reverse proxies in front of the app (Cloud Run's front end = 1). Express then
+   * takes the client IP from X-Forwarded-For, so per-client rate limiting sees
+   * real clients instead of one shared proxy address. Keep 0 when nothing proxies:
+   * a trusted header that no proxy rewrites lets callers pick their own identity.
+   */
+  trustProxyHops: number;
   gcp: {
     projectId: string;
     credentialsPath?: string;
     firestoreEmulatorHost?: string;
+    /** Firestore database to use: "(default)", or a named one (HML: "partytalk"). */
+    firestoreDatabaseId: string;
   };
   auth: {
     /** OAuth 2.0 client id the frontend signs in with; the expected `aud` of every ID token. */
@@ -20,6 +29,12 @@ export interface AppConfig {
      * account may sign in. When set, an email outside these domains is rejected.
      */
     allowedAuthDomains: string[];
+    /**
+     * Optional allow-list of exact emails (e.g. the testers of a staging
+     * environment). Combined with `allowedAuthDomains`: when either list is
+     * non-empty, an email must match one of them.
+     */
+    allowedAuthEmails: string[];
     /**
      * TEMPORARY local-testing escape hatch. When true, the guard skips Google
      * token verification entirely and treats every request as a fixed dev user.
@@ -40,12 +55,46 @@ export interface AppConfig {
     /** How many of the most recent transcript segments the host listens to per turn. */
     contextSegments: number;
   };
+  /** Outgoing email (room invitations). Off unless SMTP user + password are set. */
+  mail: {
+    smtpHost: string;
+    smtpPort: number;
+    smtpUser?: string;
+    smtpPassword?: string;
+    /** Sender shown to recipients, e.g. `PartyTalk <partytalk.hml@gmail.com>`. */
+    from?: string;
+    /** Public URL of the web app, for links in emails (no trailing slash). */
+    webAppUrl: string;
+  };
+  realtime: {
+    /**
+     * Pub/Sub topic that shares Socket.IO rooms and broadcasts across API
+     * instances. Unset = Socket.IO's in-memory adapter (one process only: fine
+     * locally, wrong on Cloud Run, which can run two instances at once).
+     */
+    pubsubTopic?: string;
+  };
+  /** ICE servers handed to browsers for the P2P voice mesh. */
+  webrtc: {
+    /** Free STUN servers — enough for most home networks. */
+    stunUrls: string[];
+    /**
+     * TURN relay URLs (e.g. `turn:203.0.113.7:3478?transport=udp`) for peers STUN
+     * can't connect (mobile carriers, corporate NATs). Empty = no relay.
+     */
+    turnUrls: string[];
+    /** coturn `static-auth-secret`; TURN is offered only when this is set too. */
+    turnSecret?: string;
+    /** Lifetime of each minted TURN credential, in seconds. */
+    turnCredentialTtlSeconds: number;
+  };
 }
 
 export default (): AppConfig => ({
   env: process.env.NODE_ENV ?? 'development',
   port: parseInt(process.env.PORT ?? '3000', 10),
-  corsOrigins: (process.env.CORS_ORIGINS ?? 'http://localhost:5173')
+  trustProxyHops: parseInt(process.env.TRUST_PROXY_HOPS ?? '0', 10),
+  corsOrigins: (process.env.CORS_ORIGINS ?? 'http://localhost:3000')
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean),
@@ -53,12 +102,17 @@ export default (): AppConfig => ({
     projectId: process.env.GCP_PROJECT_ID ?? '',
     credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS || undefined,
     firestoreEmulatorHost: process.env.FIRESTORE_EMULATOR_HOST || undefined,
+    firestoreDatabaseId: process.env.FIRESTORE_DATABASE_ID || '(default)',
   },
   auth: {
     googleOAuthClientId: process.env.GOOGLE_OAUTH_CLIENT_ID ?? '',
     allowedAuthDomains: (process.env.ALLOWED_AUTH_DOMAINS ?? '')
       .split(',')
       .map((domain) => domain.trim().toLowerCase())
+      .filter(Boolean),
+    allowedAuthEmails: (process.env.ALLOWED_AUTH_EMAILS ?? '')
+      .split(',')
+      .map((email) => email.trim().toLowerCase())
       .filter(Boolean),
     disabled: process.env.AUTH_DISABLED === 'true',
   },
@@ -73,5 +127,34 @@ export default (): AppConfig => ({
     ),
     silenceMs: parseInt(process.env.ROOM_SILENCE_MS ?? '25000', 10),
     contextSegments: parseInt(process.env.ROOM_CONTEXT_SEGMENTS ?? '25', 10),
+  },
+  mail: {
+    smtpHost: process.env.SMTP_HOST || 'smtp.gmail.com',
+    smtpPort: parseInt(process.env.SMTP_PORT || '465', 10),
+    smtpUser: process.env.SMTP_USER || undefined,
+    smtpPassword: process.env.SMTP_PASSWORD || undefined,
+    from: process.env.MAIL_FROM || undefined,
+    webAppUrl: (process.env.WEB_APP_URL || 'http://localhost:3000').replace(
+      /\/+$/,
+      '',
+    ),
+  },
+  realtime: {
+    pubsubTopic: process.env.SOCKET_IO_PUBSUB_TOPIC || undefined,
+  },
+  webrtc: {
+    stunUrls: (process.env.STUN_URLS ?? 'stun:stun.l.google.com:19302')
+      .split(',')
+      .map((url) => url.trim())
+      .filter(Boolean),
+    turnUrls: (process.env.TURN_URLS ?? '')
+      .split(',')
+      .map((url) => url.trim())
+      .filter(Boolean),
+    turnSecret: process.env.TURN_SECRET || undefined,
+    turnCredentialTtlSeconds: parseInt(
+      process.env.TURN_CREDENTIAL_TTL_SECONDS ?? '21600',
+      10,
+    ),
   },
 });

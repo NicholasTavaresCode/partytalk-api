@@ -1,6 +1,9 @@
 # Live Audio + Real-time AI Facilitator — Architecture (Milestone Design)
 
-**Status:** proposed · **Date:** 2026-07-07 · **Owner:** backend
+**Status:** M0 (socket auth) and M1 (signaling relay, in `RoomsGateway`) implemented, plus the TURN part of M5 (coturn `use-auth-secret` credentials minted per user by the API at `GET /rooms/:id/ice-servers`; the relay itself is provisioned separately); M2+ proposed · **Date:** 2026-07-07 · **Owner:** backend
+
+> M1 adds one event beyond §5: `webrtc:peer-left { uid }`, broadcast to the room
+> when a voice member leaves or disconnects, so peers drop the connection at once.
 
 This document designs the subsystem that lets people hold a **real-time group
 voice call** while the **AI listens to the live audio server-side** and steps in with

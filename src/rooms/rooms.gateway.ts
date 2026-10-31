@@ -3,7 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import {
   ConnectedSocket,
   MessageBody,
-  OnGatewayConnection,
+  OnGatewayDisconnect,
+  OnGatewayInit,
   SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
@@ -18,6 +19,14 @@ import { RoomReport } from './entities/room-report.entity';
 import { shouldEvaluateByVolume } from './facilitator/facilitator-policy';
 import { RoomsService } from './rooms.service';
 
+/** Mirrors PostTranscriptDto's limit for the REST path. */
+const MAX_SEGMENT_CHARS = 2000;
+
+/** Socket.IO room holding every socket in a room's voice mesh. */
+const voiceRoom = (roomId: string) => `voice:${roomId}`;
+/** Socket.IO room holding the one socket that speaks for `uid` in that mesh. */
+const voiceSeat = (roomId: string, uid: string) => `voice:${roomId}:${uid}`;
+
 interface JoinRoomPayload {
   roomId: string;
 }
@@ -27,8 +36,26 @@ interface TranscriptPayload {
   text: string;
 }
 
-/** The authenticated user is attached to the socket at connection time. */
-type AuthedSocket = Socket & { data: { user?: AuthenticatedPrincipal } };
+/** A WebRTC signaling message addressed to one peer in the room. */
+interface SignalPayload {
+  roomId: string;
+  toUid: string;
+  sdp?: unknown;
+  candidate?: unknown;
+}
+
+/**
+ * The authenticated user is attached to the socket at connection time; `rooms`
+ * and `voice` remember which rooms (and voice meshes) it entered, because
+ * Socket.IO has already emptied `socket.rooms` by the time `handleDisconnect` runs.
+ */
+type AuthedSocket = Socket & {
+  data: {
+    user?: AuthenticatedPrincipal;
+    rooms?: Set<string>;
+    voice?: Set<string>;
+  };
+};
 
 /** Per-room host state kept in memory on this socket-server instance. */
 interface RoomState {
@@ -59,7 +86,7 @@ interface RoomState {
  * store (e.g. Redis).
  */
 @WebSocketGateway({ namespace: 'rooms', cors: true })
-export class RoomsGateway implements OnGatewayConnection {
+export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
@@ -80,16 +107,48 @@ export class RoomsGateway implements OnGatewayConnection {
   }
 
   /**
-   * Authenticate the Google ID token at connection time and pin the identity to
-   * the socket. Unauthenticated sockets are dropped immediately, so every
-   * handler can trust `client.data.user` and never a client-supplied uid.
+   * Authenticate every handshake in Socket.IO middleware, before the socket
+   * connects. A refusal (usually an expired Google ID token on a reconnect)
+   * reaches the client as `connect_error`, which it answers by retrying with a
+   * fresh token — instead of a connect-then-kick it can't tell apart from a
+   * real disconnect.
    */
-  async handleConnection(client: AuthedSocket): Promise<void> {
+  afterInit(server: Server): void {
+    server.use((socket, next) => {
+      void this.authenticateSocket(socket as AuthedSocket, next);
+    });
+  }
+
+  /**
+   * Pin the verified identity to the socket, so every handler can trust
+   * `client.data.user` and never a client-supplied uid.
+   */
+  async authenticateSocket(
+    client: AuthedSocket,
+    next: (err?: Error) => void,
+  ): Promise<void> {
     try {
       client.data.user = await this.wsAuth.authenticate(client);
+      next();
     } catch {
-      client.emit('error', { message: 'Unauthorized' });
-      client.disconnect(true);
+      next(new Error('Unauthorized'));
+    }
+  }
+
+  /**
+   * Drop the socket from any voice mesh so peers tear down its connection, and
+   * tell its rooms the person left — a closed tab never sends `leaveRoom`.
+   */
+  async handleDisconnect(client: AuthedSocket): Promise<void> {
+    const uid = client.data.user?.uid;
+    if (!uid) {
+      return;
+    }
+    for (const roomId of client.data.voice ?? []) {
+      await this.announceVoiceLeftIfGone(roomId, uid);
+    }
+    for (const roomId of client.data.rooms ?? []) {
+      await this.announceLeftIfGone(roomId, uid);
     }
   }
 
@@ -99,17 +158,18 @@ export class RoomsGateway implements OnGatewayConnection {
     @MessageBody() payload: JoinRoomPayload,
   ): Promise<void> {
     const user = this.requireUser(client);
-
-    // Only actual room participants (they joined via REST) may subscribe.
-    const room = await this.roomsService.getRoom(payload.roomId);
-    if (!room.participantIds.includes(user.uid)) {
-      client.emit('error', {
-        message: 'You are not a participant of this room',
-      });
+    if (!(await this.mayEnter(client, user, payload.roomId))) {
       return;
     }
 
     await client.join(payload.roomId);
+    (client.data.rooms ??= new Set()).add(payload.roomId);
+    // `presence` only reports people who join later, so hand the newcomer
+    // everyone already here — otherwise the host shows up as an offline "Guest".
+    client.emit('roster', {
+      roomId: payload.roomId,
+      members: await this.membersOf(payload.roomId),
+    });
     this.server.to(payload.roomId).emit('presence', {
       roomId: payload.roomId,
       uid: user.uid,
@@ -124,12 +184,10 @@ export class RoomsGateway implements OnGatewayConnection {
     @MessageBody() payload: JoinRoomPayload,
   ): Promise<void> {
     const user = this.requireUser(client);
+    await this.leaveVoice(client, payload.roomId, user.uid);
     await client.leave(payload.roomId);
-    this.server.to(payload.roomId).emit('presence', {
-      roomId: payload.roomId,
-      uid: user.uid,
-      event: 'left',
-    });
+    client.data.rooms?.delete(payload.roomId);
+    await this.announceLeftIfGone(payload.roomId, user.uid);
   }
 
   @SubscribeMessage('transcript')
@@ -138,12 +196,35 @@ export class RoomsGateway implements OnGatewayConnection {
     @MessageBody() payload: TranscriptPayload,
   ): Promise<void> {
     const user = this.requireUser(client);
-    const segment = await this.roomsService.addTranscriptSegment(
+    // Sockets only enter the room after joinRoom's participant check, so this
+    // in-memory test authorizes the hot path without a Firestore read.
+    if (!client.rooms.has(payload.roomId)) {
+      client.emit('error', {
+        message: 'Join the room before sending transcript',
+      });
+      return;
+    }
+    const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+    if (!text || text.length > MAX_SEGMENT_CHARS) {
+      return;
+    }
+
+    // Fan out first so listeners see the line at socket latency; the write
+    // lands afterwards and must finish before the facilitator reads history.
+    const segment = this.roomsService.buildTranscriptSegment(
       payload.roomId,
       { uid: user.uid, name: user.name },
-      payload.text,
+      text,
     );
     this.server.to(payload.roomId).emit('transcript', segment);
+    try {
+      await this.roomsService.saveTranscriptSegment(segment);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to persist segment for room ${payload.roomId}: ${(error as Error).message}`,
+      );
+      return;
+    }
 
     const state = this.stateFor(payload.roomId);
     state.sinceLastConsult += 1;
@@ -195,7 +276,79 @@ export class RoomsGateway implements OnGatewayConnection {
   /** Broadcast the end-of-session report and drop the room's timers/state. */
   broadcastSessionEnded(roomId: string, report?: RoomReport): void {
     this.clearRoomState(roomId);
+    this.server.in(voiceRoom(roomId)).socketsLeave(voiceRoom(roomId));
     this.server.to(roomId).emit('sessionEnded', { roomId, report });
+  }
+
+  /**
+   * Forward a signaling message to one peer's seat, on whichever instance it
+   * is. The sender must still hold its own seat in this room's mesh (a newer
+   * tab may have taken it over) and is stamped from the verified socket —
+   * never from the payload. Checking costs no I/O: it's the socket's own rooms.
+   */
+  private relay(
+    client: AuthedSocket,
+    payload: SignalPayload,
+    event: string,
+    body: Record<string, unknown>,
+  ): void {
+    const user = this.requireUser(client);
+    if (
+      typeof payload?.roomId !== 'string' ||
+      typeof payload.toUid !== 'string' ||
+      !client.rooms.has(voiceRoom(payload.roomId)) ||
+      !client.rooms.has(voiceSeat(payload.roomId, user.uid))
+    ) {
+      return;
+    }
+    this.server
+      .to(voiceSeat(payload.roomId, payload.toUid))
+      .emit(event, { fromUid: user.uid, ...body });
+  }
+
+  private async leaveVoice(
+    client: AuthedSocket,
+    roomId: string,
+    uid: string,
+  ): Promise<void> {
+    if (!client.data.voice?.delete(roomId)) {
+      return;
+    }
+    await client.leave(voiceRoom(roomId));
+    await client.leave(voiceSeat(roomId, uid));
+    await this.announceVoiceLeftIfGone(roomId, uid);
+  }
+
+  /** Tell the mesh a peer left, unless they're still in it from another socket. */
+  private async announceVoiceLeftIfGone(
+    roomId: string,
+    uid: string,
+  ): Promise<void> {
+    if ((await this.uidsIn(voiceRoom(roomId))).includes(uid)) {
+      return;
+    }
+    this.server
+      .to([roomId, voiceRoom(roomId)])
+      .emit('webrtc:peer-left', { uid });
+  }
+
+  /**
+   * Only people who took a seat via REST *and* are still invited may subscribe —
+   * the invite check stops a revoked user from slipping back in on reconnect.
+   */
+  private async mayEnter(
+    client: AuthedSocket,
+    user: AuthenticatedPrincipal,
+    roomId: string,
+  ): Promise<boolean> {
+    const room = await this.roomsService.getRoom(roomId);
+    if (room.participantIds.includes(user.uid) && canAccessRoom(room, user)) {
+      return true;
+    }
+    client.emit('error', {
+      message: 'You are not a participant of this room',
+    });
+    return false;
   }
 
   private scheduleSilenceTrigger(roomId: string): void {
@@ -261,10 +414,18 @@ export class RoomsGateway implements OnGatewayConnection {
     }
   }
 
+  private resetTriggers(state: RoomState): void {
+    state.sinceLastSuggestion = 0;
+    if (state.silenceTimer) {
+      clearTimeout(state.silenceTimer);
+      state.silenceTimer = undefined;
+    }
+  }
+
   private requireUser(client: AuthedSocket): AuthenticatedPrincipal {
     const user = client.data.user;
     if (!user) {
-      // Should not happen — handleConnection drops unauthenticated sockets.
+      // Should not happen — the handshake middleware refuses unauthenticated sockets.
       client.disconnect(true);
       throw new Error('Unauthenticated socket');
     }
