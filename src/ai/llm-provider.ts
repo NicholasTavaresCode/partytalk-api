@@ -1,5 +1,5 @@
 /**
- * Provider-agnostic LLM contract. The AI host and IELTS scoring depend on this
+ * Provider-agnostic LLM contract. The AI host depends on this
  * abstract class (used as a DI token), never on a concrete SDK, so Vertex/Gemini
  * can be swapped for another provider — or a deterministic fake in tests —
  * without touching business logic (di-use-interfaces-tokens).
@@ -14,12 +14,12 @@ export interface LlmMessage {
 export interface LlmGenerateRequest {
   /** Model id override; falls back to the provider's configured default. */
   model?: string;
-  /** System instruction that steers behavior (persona, rubric, constraints). */
+  /** System instruction that steers behavior (persona, constraints). */
   system?: string;
   messages: LlmMessage[];
   temperature?: number;
   maxOutputTokens?: number;
-  /** Request strict JSON output (used by rubric scoring). */
+  /** Request strict JSON output (every host prompt uses it). */
   json?: boolean;
 }
 

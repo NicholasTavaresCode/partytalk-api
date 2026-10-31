@@ -27,8 +27,7 @@ export const validationSchema = Joi.object({
   AUTH_DISABLED: Joi.boolean().default(false),
 
   VERTEX_LOCATION: Joi.string().default('us-central1'),
-  VERTEX_HOST_MODEL: Joi.string().default('gemini-2.0-flash'),
-  VERTEX_SCORING_MODEL: Joi.string().default('gemini-2.0-flash'),
+  VERTEX_HOST_MODEL: Joi.string().default('gemini-2.5-flash-lite'),
 
   ROOM_SUGGEST_EVERY_SEGMENTS: Joi.number().integer().min(1).default(8),
   ROOM_SILENCE_MS: Joi.number().integer().min(1000).default(25000),

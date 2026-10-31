@@ -10,8 +10,6 @@ import { TransformInterceptor } from './common/interceptors/transform.intercepto
 import { AppConfigModule } from './config/config.module';
 import { FirestoreModule } from './firestore/firestore.module';
 import { HealthModule } from './health/health.module';
-import { MailModule } from './mail/mail.module';
-import { IeltsModule } from './ielts/ielts.module';
 import { RoomsModule } from './rooms/rooms.module';
 import { UsersModule } from './users/users.module';
 
@@ -93,7 +91,6 @@ const CLOUD_LOGGING_SEVERITY: Record<string, string> = {
     HealthModule,
     UsersModule,
     RoomsModule,
-    IeltsModule,
   ],
   providers: [
     // Rate limiting first, then authentication (security-rate-limiting, security-use-guards).

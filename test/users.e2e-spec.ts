@@ -128,7 +128,6 @@ describe('Users (e2e)', () => {
       .send({
         displayName: 'Alice',
         englishLevel: 'intermediate',
-        targetIeltsBand: 7,
       })
       .expect(200)
       .expect((res) => {

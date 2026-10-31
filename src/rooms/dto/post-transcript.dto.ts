@@ -8,7 +8,8 @@ import { IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
  */
 export class PostTranscriptDto {
   @ApiProperty({
-    description: 'Transcribed text of the utterance (from client speech-to-text).',
+    description:
+      'Transcribed text of the utterance (from client speech-to-text).',
     example: 'This weekend I’m planning to visit the coast with some friends.',
     minLength: 1,
     maxLength: 2000,

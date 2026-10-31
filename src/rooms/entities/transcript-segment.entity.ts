@@ -2,8 +2,8 @@ import { ApiProperty } from '@nestjs/swagger';
 
 /**
  * A single utterance in a room's voice transcript, produced by client-side
- * speech-to-text and streamed to the backend in real time. The AI facilitator
- * reads a rolling window of these to decide when (and what) to suggest.
+ * speech-to-text and streamed to the backend in real time. The AI host listens
+ * to a rolling window of these to decide when to step in with a new topic.
  *
  * Declared as a class so `@nestjs/swagger` can reflect it; object literals stay
  * structurally assignable.

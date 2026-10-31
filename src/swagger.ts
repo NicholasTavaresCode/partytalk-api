@@ -16,15 +16,11 @@ const TAG_DESCRIPTIONS: Array<[name: string, description: string]> = [
   ],
   [
     'Users',
-    'The authenticated user’s own learner profile (English level, IELTS target). Identity always comes from the verified Google ID token — never from the URL.',
+    'The authenticated user’s own learner profile (display name, English level). Identity always comes from the verified Google ID token — never from the URL.',
   ],
   [
     'Rooms',
-    'Live group English-practice rooms guided by an AI host: create, discover, join/leave, run the session lifecycle, and exchange transcript messages. Realtime delivery is over the Socket.IO `rooms` namespace; these REST endpoints own persistence and host replies.',
-  ],
-  [
-    'IELTS',
-    'Solo IELTS exam simulator. Browse exam content per section, run an attempt, submit responses, and score it — Listening/Reading auto-scored against a key, Writing/Speaking graded by the AI against the IELTS band rubric.',
+    'Live group English-practice rooms with an AI host that is always in the room: create, discover, join/leave, run the session lifecycle, and stream transcript segments. The host keeps listening and, once a topic has been talked about enough, speaks up to move the group onto a completely different one. Realtime delivery is over the Socket.IO `rooms` namespace; these REST endpoints own persistence, the manual topic change, and reads.',
   ],
 ];
 
@@ -38,7 +34,7 @@ export function setupSwagger(app: INestApplication): void {
     .setTitle('PartyTalk API')
     .setDescription(
       [
-        'Backend for PartyTalk — live group English-practice rooms with an AI host, plus a solo IELTS exam simulator.',
+        'Backend for PartyTalk — live group English-practice rooms with an AI host that keeps moving the conversation onto new, unrelated topics.',
         '',
         '**Authentication.** All endpoints require a Google Identity ("Sign in with Google") ID token as `Authorization: Bearer <token>` unless explicitly public (the health probes). Click **Authorize** and paste a token.',
         '',

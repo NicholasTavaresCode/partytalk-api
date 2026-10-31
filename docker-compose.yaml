@@ -58,5 +58,5 @@ services:
       start_period: 20s
     volumes:
       # Host ADC from `gcloud auth application-default login` (read-only, optional).
-      # Only required if you exercise Vertex AI (AI host / IELTS scoring) locally.
+      # Only required if you exercise Vertex AI (the AI host) locally.
       - ${HOME}/.config/gcloud/application_default_credentials.json:/gcp/adc.json:ro

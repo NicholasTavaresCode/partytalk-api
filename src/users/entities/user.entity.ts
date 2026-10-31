@@ -1,7 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { AccountStatus } from '../../common/interfaces/authenticated-principal.interface';
 
-/** English proficiency band a learner self-selects, used to tailor room + exam difficulty. */
+/** English proficiency band a learner self-selects, used to tailor room difficulty. */
 export type EnglishLevel =
   | 'beginner'
   | 'elementary'
@@ -22,7 +22,7 @@ export const ENGLISH_LEVELS: EnglishLevel[] = [
  * user ids, keeping identity consistent across Google Identity, Firestore and
  * realtime sockets. The record is JIT-provisioned on first login with just
  * identity + `status`; the learner-profile fields (`displayName`,
- * `englishLevel`, `targetIeltsBand`) are filled in later via `PUT /users/me`
+ * `englishLevel`) are filled in later via `PUT /users/me`
  * and so are optional here.
  *
  * Declared as a class (not an interface) so `@nestjs/swagger` can reflect it
@@ -66,15 +66,6 @@ export class User {
     example: 'intermediate',
   })
   englishLevel?: EnglishLevel;
-
-  @ApiProperty({
-    required: false,
-    minimum: 1,
-    maximum: 9,
-    description: 'Target overall IELTS band the learner is aiming for.',
-    example: 7.5,
-  })
-  targetIeltsBand?: number;
 
   @ApiProperty({
     format: 'date-time',

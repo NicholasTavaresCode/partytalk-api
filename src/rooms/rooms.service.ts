@@ -5,24 +5,25 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { LlmProvider } from '../ai/llm-provider';
 import { AppConfig } from '../config/configuration';
 import { CreateRoomDto } from './dto/create-room.dto';
-import { IceServers } from './entities/ice-servers.entity';
-import { Room } from './entities/room.entity';
+import { HostMessage, HostTrigger } from './entities/host-message.entity';
+import { DEFAULT_ROOM_DURATION_MINUTES, Room } from './entities/room.entity';
 import { RoomReport } from './entities/room-report.entity';
-import {
-  SuggestionTrigger,
-  TopicSuggestion,
-} from './entities/topic-suggestion.entity';
 import { TranscriptSegment } from './entities/transcript-segment.entity';
 import {
+  buildHostPrompt,
+  buildOpeningTopicPrompt,
   buildReportPrompt,
-  buildTopicSuggestionPrompt,
+  HostTurn,
+  OPENING_TOPIC_AREAS,
+  parseHostTurn,
+  parseOpeningTopic,
   parseReport,
-  parseSuggestion,
 } from './facilitator/facilitator-prompts';
 import { User } from '../users/entities/user.entity';
 import { UsersRepository } from '../users/users.repository';
@@ -39,12 +40,11 @@ import { buildIceServers } from './ice-servers';
 import { RoomInvitations } from './room-invitations';
 import { RoomsRepository } from './rooms.repository';
 
-const DEFAULT_FACILITATOR_PERSONA =
-  'A warm, curious facilitator who nudges the group toward fresh, related topics';
 const DEFAULT_MAX_PARTICIPANTS = 5;
 /** Hard cap on transcript pulled for the end-of-session report. */
 const REPORT_TRANSCRIPT_LIMIT = 500;
-const NOT_INVITED = 'You are not invited to this room';
+/** Hard cap on host lines pulled per turn (a session has a handful, not hundreds). */
+const HOST_HISTORY_LIMIT = 100;
 
 export interface Speaker {
   uid: string;
@@ -52,10 +52,14 @@ export interface Speaker {
 }
 
 /**
- * Owns room lifecycle and the AI-facilitator business rules. Participants talk
- * by voice; the frontend streams speech-to-text as transcript segments. This
- * service persists that transcript, generates topic-pivot suggestions from a
- * rolling window, and writes a single room-level report when the session ends.
+ * Owns room lifecycle and the AI host's business rules. Participants talk by
+ * voice; the frontend streams speech-to-text as transcript segments. The host
+ * is always in the room: each time it is consulted it listens to the most
+ * recent window of the conversation (plus what it already said), decides on
+ * its own whether the current topic has been talked about enough and, if so,
+ * says a line that moves the group onto a completely different topic. A room
+ * has a fixed session length: the gateway's clock calls `expireRoom` when it
+ * runs out, and either way the host writes a single room-level report on end.
  *
  * Rooms are invite-only: every caller-facing method enforces `canAccessRoom`
  * (owner + invited emails), writes additionally require having joined, and
@@ -82,18 +86,29 @@ export class RoomsService {
     this.webrtc = config.get('webrtc', { infer: true });
   }
 
-  async createRoom(owner: RoomCaller, dto: CreateRoomDto): Promise<Room> {
+  /**
+   * Open a new room. The opening topic comes from the creator or — with
+   * `hostPicksTopic` — from the AI host, fetched before anything is persisted.
+   */
+  async createRoom(ownerId: string, dto: CreateRoomDto): Promise<Room> {
+    const topicPickedByHost = dto.hostPicksTopic === true;
+    const topic = topicPickedByHost ? await this.pickOpeningTopic() : dto.topic;
+    if (!topic) {
+      // Unreachable behind the ValidationPipe; keeps the entity invariant if not.
+      throw new BadRequestException(
+        'topic is required unless hostPicksTopic is true',
+      );
+    }
     const now = new Date().toISOString();
     const room: Room = {
       id: crypto.randomUUID(),
-      topic: dto.topic,
-      facilitatorPersona: dto.facilitatorPersona ?? DEFAULT_FACILITATOR_PERSONA,
+      topic,
+      topicPickedByHost,
       status: 'waiting',
       ownerId: owner.uid,
       participantIds: [owner.uid],
       maxParticipants: dto.maxParticipants ?? DEFAULT_MAX_PARTICIPANTS,
-      invitedEmails: normalizeInvites(dto.invitedEmails ?? [], owner.email),
-      inviteCode: null,
+      durationMinutes: dto.durationMinutes ?? DEFAULT_ROOM_DURATION_MINUTES,
       createdAt: now,
       updatedAt: now,
     };
@@ -102,14 +117,35 @@ export class RoomsService {
     return created;
   }
 
-  /** Open rooms the caller owns or is invited to — strangers' rooms never list. */
-  async listRoomsFor(caller: RoomCaller, limit: number): Promise<Room[]> {
-    const rooms = await this.roomsRepository.listOpenForMember(
-      caller.uid,
-      caller.email ? normalizeEmail(caller.email) : undefined,
-      limit,
-    );
-    return rooms.map((room) => this.viewFor(room, caller.uid));
+  /**
+   * Ask the host for an opening topic. An area is drawn at random so rooms do
+   * not all open on the same subject. Fails with 503 if the AI is unavailable
+   * or replies unusably — the creator can retry or type a topic themselves;
+   * we deliberately never substitute a canned topic for one they asked the
+   * host to choose.
+   */
+  private async pickOpeningTopic(): Promise<string> {
+    const area =
+      OPENING_TOPIC_AREAS[
+        Math.floor(Math.random() * OPENING_TOPIC_AREAS.length)
+      ];
+    try {
+      const { text } = await this.llm.generate(
+        buildOpeningTopicPrompt({ area }),
+      );
+      return parseOpeningTopic(text);
+    } catch (error) {
+      this.logger.warn(
+        `Host could not pick an opening topic: ${(error as Error).message}`,
+      );
+      throw new ServiceUnavailableException(
+        'The AI host could not pick a topic right now — try again or enter one yourself',
+      );
+    }
+  }
+
+  listOpenRooms(limit: number): Promise<Room[]> {
+    return this.roomsRepository.listOpen(limit);
   }
 
   /**
@@ -258,29 +294,66 @@ export class RoomsService {
     return this.persistUpdate(id, { inviteCode: null });
   }
 
+  /**
+   * Open the session. Only a `waiting` room can start, so the clock can never
+   * be restarted (which would extend the session). Stamps `startedAt` and
+   * `scheduledEndAt`; the gateway arms the timer that ends the room on time.
+   */
   async startRoom(id: string, requesterUid: string): Promise<Room> {
     const room = await this.getRoom(id);
     this.assertOwner(room, requesterUid);
-    // The facilitator reacts to the conversation, so there is nothing to say
-    // until people start talking — just open the room.
-    return this.persistUpdate(id, { status: 'live' });
+    if (room.status !== 'waiting') {
+      throw new ConflictException(
+        room.status === 'live' ? 'Room has already started' : 'Room has ended',
+      );
+    }
+    // The host reacts to the conversation, so there is nothing to say until
+    // people start talking — just open the room and start the clock.
+    const startedAt = new Date();
+    // Rooms created before session lengths existed carry no duration.
+    const minutes = room.durationMinutes ?? DEFAULT_ROOM_DURATION_MINUTES;
+    return this.persistUpdate(id, {
+      status: 'live',
+      startedAt: startedAt.toISOString(),
+      scheduledEndAt: new Date(
+        startedAt.getTime() + minutes * 60_000,
+      ).toISOString(),
+    });
   }
 
+  /** The owner ends the session early (it otherwise ends at `scheduledEndAt`). */
   async endRoom(id: string, requesterUid: string): Promise<Room> {
     const room = await this.getRoom(id);
     this.assertOwner(room, requesterUid);
+    return this.finishRoom(room);
+  }
 
+  /**
+   * Time is up: end a live room on behalf of the clock, with no owner check.
+   * Idempotent — returns `null` when the room has already ended (the owner got
+   * there first), so nothing is reported or broadcast twice.
+   */
+  async expireRoom(id: string): Promise<Room | null> {
+    const room = await this.getRoom(id);
+    if (room.status === 'ended') {
+      return null;
+    }
+    return this.finishRoom(room);
+  }
+
+  /** Close the session: write the report (best-effort) and mark the room ended. */
+  private async finishRoom(room: Room): Promise<Room> {
     // Best-effort report: ending the room must not fail if the LLM is down.
     let report: RoomReport | undefined;
     try {
       report = await this.generateReport(room);
     } catch (error) {
       this.logger.warn(
-        `Report generation failed for room ${id}: ${(error as Error).message}`,
+        `Report generation failed for room ${room.id}: ${(error as Error).message}`,
       );
     }
 
-    return this.persistUpdate(id, {
+    return this.persistUpdate(room.id, {
       status: 'ended',
       endedAt: new Date().toISOString(),
       ...(report ? { report } : {}),
@@ -326,33 +399,63 @@ export class RoomsService {
   }
 
   /**
-   * Read the recent transcript window and ask the model for one new, related
-   * topic that pushes the group's versatility; persist and return it.
+   * Manual override: the host speaks now regardless of its own judgement. Used
+   * when a participant asks for a fresh topic (e.g. they did not like the
+   * current one).
    */
-  async generateTopicSuggestion(
-    id: string,
-    trigger: SuggestionTrigger,
-  ): Promise<TopicSuggestion> {
-    const room = await this.getRoom(id);
-    const transcript = await this.roomsRepository.listSegments(
-      id,
-      this.facilitator.contextSegments,
-    );
+  async forceTopicChange(id: string): Promise<HostMessage> {
+    const turn = await this.hostTurn(id, 'manual');
+    return this.persistHostMessage(id, 'manual', turn);
+  }
 
+  /**
+   * Auto path: consult the host and let it judge, from the live conversation,
+   * whether now is the moment to step in. Returns the persisted line only when
+   * it speaks; otherwise `null` — it stays quiet while talk is flowing.
+   */
+  async consultHost(
+    id: string,
+    trigger: HostTrigger,
+  ): Promise<HostMessage | null> {
+    const turn = await this.hostTurn(id, trigger);
+    if (!turn.shouldSpeak) {
+      return null;
+    }
+    return this.persistHostMessage(id, trigger, turn);
+  }
+
+  /** One host turn: listen to the recent window (and its own past lines), then decide. */
+  private async hostTurn(id: string, trigger: HostTrigger): Promise<HostTurn> {
+    const room = await this.getRoom(id);
+    const [transcript, hostMessages] = await Promise.all([
+      this.roomsRepository.listRecentSegments(
+        id,
+        this.facilitator.contextSegments,
+      ),
+      this.roomsRepository.listHostMessages(id, HOST_HISTORY_LIMIT),
+    ]);
     const { text } = await this.llm.generate(
-      buildTopicSuggestionPrompt({
-        persona: room.facilitatorPersona,
+      buildHostPrompt({
         seedTopic: room.topic,
         transcript,
+        hostMessages,
+        trigger,
       }),
     );
-    const { topic, rationale } = parseSuggestion(text);
+    return parseHostTurn(text);
+  }
 
-    return this.roomsRepository.addSuggestion({
+  private persistHostMessage(
+    roomId: string,
+    trigger: HostTrigger,
+    turn: HostTurn,
+  ): Promise<HostMessage> {
+    return this.roomsRepository.addHostMessage({
       id: crypto.randomUUID(),
-      roomId: id,
-      topic,
-      rationale,
+      roomId,
+      message: turn.message,
+      topic: turn.topic,
+      reason: turn.reason,
       trigger,
       at: new Date().toISOString(),
     });
@@ -396,27 +499,17 @@ export class RoomsService {
     return this.roomsRepository.listSegments(id, limit);
   }
 
-  async listSuggestions(
-    id: string,
-    caller: RoomCaller,
-    limit: number,
-  ): Promise<TopicSuggestion[]> {
-    await this.accessibleRoom(id, caller);
-    return this.roomsRepository.listSuggestions(id, limit);
-  }
-
-  /** How many segments a room has — used by the gateway's volume trigger. */
-  countSegments(id: string): Promise<number> {
-    return this.roomsRepository.countSegments(id);
+  listHostMessages(id: string, limit: number): Promise<HostMessage[]> {
+    return this.roomsRepository.listHostMessages(id, limit);
   }
 
   private async generateReport(room: Room): Promise<RoomReport> {
-    const transcript = await this.roomsRepository.listSegments(
-      room.id,
-      REPORT_TRANSCRIPT_LIMIT,
-    );
+    const [transcript, hostMessages] = await Promise.all([
+      this.roomsRepository.listSegments(room.id, REPORT_TRANSCRIPT_LIMIT),
+      this.roomsRepository.listHostMessages(room.id, HOST_HISTORY_LIMIT),
+    ]);
     const { text } = await this.llm.generate(
-      buildReportPrompt({ seedTopic: room.topic, transcript }),
+      buildReportPrompt({ seedTopic: room.topic, transcript, hostMessages }),
     );
     return { ...parseReport(text), generatedAt: new Date().toISOString() };
   }

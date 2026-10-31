@@ -4,7 +4,7 @@ import { VertexLlmProvider } from './vertex/vertex-llm.provider';
 
 /**
  * Provides the LlmProvider abstraction bound to Vertex AI (Gemini). Global so
- * both the Rooms AI host and IELTS scoring can inject it. Rebinding to a
+ * any feature (today: the rooms' AI host) can inject it. Rebinding to a
  * different provider (or a fake) is a one-line change here.
  */
 @Global()

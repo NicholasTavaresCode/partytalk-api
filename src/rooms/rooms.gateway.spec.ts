@@ -1,6 +1,8 @@
 import { ConfigService } from '@nestjs/config';
 import { Server, Socket } from 'socket.io';
 import { WsAuthenticator } from '../auth/ws-authenticator';
+import { HostMessage } from './entities/host-message.entity';
+import { Room } from './entities/room.entity';
 import { RoomsGateway } from './rooms.gateway';
 import { RoomsService } from './rooms.service';
 
@@ -23,27 +25,21 @@ describe('RoomsGateway', () => {
     local: { in: jest.Mock };
   };
   let service: {
-    buildTranscriptSegment: jest.Mock;
-    saveTranscriptSegment: jest.Mock;
-    generateTopicSuggestion: jest.Mock;
+    addTranscriptSegment: jest.Mock;
+    consultHost: jest.Mock;
+    expireRoom: jest.Mock;
     getRoom: jest.Mock;
   };
   let wsAuth: { authenticate: jest.Mock };
 
-  /** A broadcast operator over some rooms, like `server.to(...)` / `server.in(...)`. */
-  const operator = (rooms: string[], except: string[] = []) => {
-    const targets = () =>
-      [...new Set(rooms.flatMap((r) => [...(members.get(r) ?? [])]))].filter(
-        (s) => !except.includes(s.id),
-      );
-    return {
-      emit: (event: string, payload: unknown) => emit(event, payload),
-      except: (room: string) => operator(rooms, [...except, room]),
-      fetchSockets: () => Promise.resolve(targets()),
-      socketsLeave: (leave: string | string[]) => {
-        for (const s of targets()) [leave].flat().forEach((r) => s.leave(r));
-      },
-    };
+  const hostLine: HostMessage = {
+    id: 'h1',
+    roomId: 'r1',
+    message: "Ok. Now let's talk about the Usain Bolt record.",
+    topic: 'The Usain Bolt record',
+    reason: 'why',
+    trigger: 'volume',
+    at: 't',
   };
 
   const buildGateway = (everySegments: number, silenceMs = 25_000) => {
@@ -76,34 +72,9 @@ describe('RoomsGateway', () => {
       data: { user: { uid, name, email: `${uid}@example.com` } },
       emit: jest.fn(),
       disconnect: jest.fn(),
-    } as unknown as FakeSocket & { add: (room: string) => void };
-    s.add = (room: string) => {
-      s.rooms.add(room);
-      if (!members.has(room)) members.set(room, new Set());
-      members.get(room)!.add(s);
+    }) as unknown as Socket & {
+      data: { user?: { uid: string; name?: string } };
     };
-    s.join = jest.fn((r: string | string[]) =>
-      [r].flat().forEach(s.add),
-    ) as never;
-    s.leave = jest.fn((room: string) => {
-      s.rooms.delete(room);
-      members.get(room)?.delete(s);
-    }) as never;
-    rooms.forEach(s.add);
-    return s;
-  };
-
-  /** What Socket.IO does before handleDisconnect: the socket leaves every room. */
-  const dropConnection = (s: FakeSocket) =>
-    [...s.rooms].forEach((room) => members.get(room)?.delete(s));
-
-  const segment = {
-    id: 's1',
-    roomId: 'r1',
-    speakerId: 'u1',
-    text: 'hi',
-    at: 't',
-  };
 
   beforeEach(() => {
     members = new Map();
@@ -114,22 +85,18 @@ describe('RoomsGateway', () => {
       local: { in: jest.fn((r: string | string[]) => operator([r].flat())) },
     };
     service = {
-      buildTranscriptSegment: jest.fn().mockReturnValue(segment),
-      saveTranscriptSegment: jest.fn().mockResolvedValue(segment),
-      generateTopicSuggestion: jest.fn().mockResolvedValue({
-        id: 'sug1',
+      addTranscriptSegment: jest.fn().mockResolvedValue({
+        id: 's1',
         roomId: 'r1',
-        topic: 'New?',
-        rationale: 'why',
-        trigger: 'volume',
+        speakerId: 'u1',
+        text: 'hi',
         at: 't',
       }),
-      getRoom: jest.fn().mockResolvedValue({
-        id: 'r1',
-        ownerId: 'u1',
-        participantIds: ['u1'],
-        invitedEmails: [],
-      }),
+      consultHost: jest.fn().mockResolvedValue(hostLine),
+      expireRoom: jest.fn(),
+      getRoom: jest
+        .fn()
+        .mockResolvedValue({ id: 'r1', participantIds: ['u1'] }),
     };
     wsAuth = { authenticate: jest.fn() };
   });
@@ -137,11 +104,18 @@ describe('RoomsGateway', () => {
   describe('handshake authentication', () => {
     it('registers itself as Socket.IO middleware', () => {
       const gateway = buildGateway(8);
-      const use = jest.fn();
+      wsAuth.authenticate.mockResolvedValue({ uid: 'u9' });
+      const client = {
+        data: {},
+        emit: jest.fn(),
+        disconnect: jest.fn(),
+      } as never;
 
       gateway.afterInit({ use } as unknown as Server);
 
-      expect(use).toHaveBeenCalledWith(expect.any(Function));
+      expect((client as { data: { user?: unknown } }).data.user).toEqual({
+        uid: 'u9',
+      });
     });
 
     it('pins the authenticated user onto the socket and lets it connect', async () => {
@@ -191,7 +165,7 @@ describe('RoomsGateway', () => {
       id: 'r1',
       participantIds: ['someone-else'],
     });
-    const client = socket('u1', 'Ada', []);
+    const client = socket('u1');
 
     await gateway.handleJoinRoom(client, { roomId: 'r1' });
 
@@ -204,145 +178,152 @@ describe('RoomsGateway', () => {
     );
   });
 
-  it('refuses a seated participant whose invite was revoked', async () => {
-    const gateway = buildGateway(8);
-    service.getRoom.mockResolvedValue({
-      id: 'r1',
-      ownerId: 'owner',
-      participantIds: ['owner', 'u1'],
-      invitedEmails: [],
+  it('persists a transcript segment (uid from the socket) and broadcasts it', async () => {
+    const gateway = buildGateway(8); // high threshold: the host is not consulted yet
+    await gateway.handleTranscript(socket('u1', 'Ada'), {
+      roomId: 'r1',
+      text: 'hello',
     });
-    const client = socket('u1', 'Ada', []);
 
-    await gateway.handleJoinRoom(client, { roomId: 'r1' });
-
-    expect(client.join).not.toHaveBeenCalled();
-    expect(client.emit).toHaveBeenCalledWith('error', expect.anything());
+    expect(service.addTranscriptSegment).toHaveBeenCalledWith(
+      'r1',
+      { uid: 'u1', name: 'Ada' },
+      'hello',
+    );
+    expect(emit).toHaveBeenCalledWith(
+      'transcript',
+      expect.objectContaining({ id: 's1' }),
+    );
+    expect(service.consultHost).not.toHaveBeenCalled();
   });
 
-  describe('transcript', () => {
-    it('broadcasts a segment (uid from the socket) before persisting it', async () => {
-      let persist!: () => void;
-      service.saveTranscriptSegment.mockReturnValue(
-        new Promise((resolve) => (persist = () => resolve(segment))),
-      );
-      const gateway = buildGateway(8); // high threshold: no auto-suggest yet
-
-      const pending = gateway.handleTranscript(socket('u1', 'Ada'), {
-        roomId: 'r1',
-        text: ' hello ',
-      });
-
-      expect(service.buildTranscriptSegment).toHaveBeenCalledWith(
-        'r1',
-        { uid: 'u1', name: 'Ada' },
-        'hello',
-      );
-      expect(emit).toHaveBeenCalledWith('transcript', segment);
-      expect(service.saveTranscriptSegment).toHaveBeenCalledWith(segment);
-      persist();
-      await pending;
+  it('consults the host on the volume trigger and broadcasts what it says', async () => {
+    const gateway = buildGateway(1); // consult after every segment
+    await gateway.handleTranscript(socket('u1'), {
+      roomId: 'r1',
+      text: 'hello',
     });
 
-    it('rejects transcript from a socket that has not joined the room', async () => {
-      const gateway = buildGateway(8);
-      const client = socket('u1', 'Ada', []);
+    expect(service.consultHost).toHaveBeenCalledWith('r1', 'volume');
+    expect(emit).toHaveBeenCalledWith('hostMessage', hostLine);
+  });
 
-      await gateway.handleTranscript(client, { roomId: 'r1', text: 'hello' });
-
-      expect(emit).not.toHaveBeenCalledWith('transcript', expect.anything());
-      expect(service.saveTranscriptSegment).not.toHaveBeenCalled();
-      expect(client.emit).toHaveBeenCalledWith('error', expect.anything());
+  it('broadcasts nothing when the host chooses to stay quiet', async () => {
+    const gateway = buildGateway(1);
+    service.consultHost.mockResolvedValue(null);
+    await gateway.handleTranscript(socket('u1'), {
+      roomId: 'r1',
+      text: 'hello',
     });
 
-    it('survives a failed write without auto-suggesting', async () => {
-      service.saveTranscriptSegment.mockRejectedValue(
-        new Error('firestore down'),
-      );
-      const gateway = buildGateway(1);
+    expect(service.consultHost).toHaveBeenCalledWith('r1', 'volume');
+    expect(emit).not.toHaveBeenCalledWith('hostMessage', expect.anything());
+  });
 
+  it('consults the host after a silence', async () => {
+    jest.useFakeTimers();
+    try {
+      const gateway = buildGateway(100, 25_000); // volume won't fire
       await gateway.handleTranscript(socket('u1'), {
         roomId: 'r1',
         text: 'hello',
       });
-
-      expect(emit).toHaveBeenCalledWith('transcript', segment);
-      expect(service.generateTopicSuggestion).not.toHaveBeenCalled();
-    });
-
-    it('auto-suggests a topic on the volume trigger', async () => {
-      const gateway = buildGateway(1); // suggest after every segment
-      await gateway.handleTranscript(socket('u1'), {
-        roomId: 'r1',
-        text: 'hello',
-      });
-
-      expect(service.generateTopicSuggestion).toHaveBeenCalledWith(
-        'r1',
-        'volume',
-      );
-      expect(emit).toHaveBeenCalledWith(
-        'topicSuggested',
-        expect.objectContaining({ topic: 'New?' }),
-      );
-    });
-
-    it('auto-suggests a topic after a silence', async () => {
-      jest.useFakeTimers();
-      try {
-        const gateway = buildGateway(100, 25_000); // volume won't fire
-        await gateway.handleTranscript(socket('u1'), {
-          roomId: 'r1',
-          text: 'hello',
-        });
-        expect(service.generateTopicSuggestion).not.toHaveBeenCalled();
-
-        await jest.advanceTimersByTimeAsync(25_000);
-
-        expect(service.generateTopicSuggestion).toHaveBeenCalledWith(
-          'r1',
-          'silence',
-        );
-      } finally {
-        jest.useRealTimers();
-      }
-    });
-
-    it("broadcasts the host's manual topic and restarts the auto-triggers", async () => {
-      jest.useFakeTimers();
-      try {
-        const gateway = buildGateway(2, 25_000);
-        await gateway.handleTranscript(socket('u1'), {
-          roomId: 'r1',
-          text: 'one',
-        });
-        const manual = {
-          id: 'sug-m',
-          roomId: 'r1',
-          topic: 'Hidden talents',
-          rationale: 'why',
-          trigger: 'manual' as const,
-          at: 't',
-        };
+      expect(service.consultHost).not.toHaveBeenCalled();
 
         gateway.announceSuggestion('r1', manual);
 
-        expect(server.to).toHaveBeenCalledWith('r1');
-        expect(emit).toHaveBeenCalledWith('topicSuggested', manual);
-        // Neither the pending silence nudge nor the next segment fires on top of it.
-        await jest.advanceTimersByTimeAsync(25_000);
-        await gateway.handleTranscript(socket('u1'), {
-          roomId: 'r1',
-          text: 'two',
-        });
-        expect(service.generateTopicSuggestion).not.toHaveBeenCalled();
-      } finally {
-        jest.useRealTimers();
-      }
+      expect(service.consultHost).toHaveBeenCalledWith('r1', 'silence');
+      expect(emit).toHaveBeenCalledWith('hostMessage', hostLine);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('pushes the authoritative room to everyone in it after a membership change', () => {
+    const gateway = buildGateway(8);
+    const room = { id: 'r1', participantIds: ['u1', 'u2'] } as Room;
+    gateway.broadcastRoomUpdated(room);
+
+    expect(server.to).toHaveBeenCalledWith('r1');
+    expect(emit).toHaveBeenCalledWith('roomUpdated', room);
+  });
+
+  it('pushes a manually forced host line to the room', () => {
+    const gateway = buildGateway(8);
+    gateway.broadcastHostMessage(hostLine);
+
+    expect(server.to).toHaveBeenCalledWith('r1');
+    expect(emit).toHaveBeenCalledWith('hostMessage', hostLine);
+  });
+
+  describe('session clock', () => {
+    const report = {
+      summary: 's',
+      highlights: [],
+      suggestions: [],
+      topicsExplored: [],
+      generatedAt: 't',
+    };
+    /** A live room whose scheduled end is `inMs` from (fake) now. */
+    const liveRoom = (inMs: number): Room =>
+      ({
+        id: 'r1',
+        status: 'live',
+        scheduledEndAt: new Date(Date.now() + inMs).toISOString(),
+      }) as Room;
+
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it('ends the session server-side when the time is up', async () => {
+      const gateway = buildGateway(100);
+      service.expireRoom.mockResolvedValue({
+        id: 'r1',
+        status: 'ended',
+        report,
+      });
+      gateway.scheduleSessionEnd(liveRoom(10 * 60_000));
+
+      await jest.advanceTimersByTimeAsync(10 * 60_000 - 1);
+      expect(service.expireRoom).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(1);
+      expect(service.expireRoom).toHaveBeenCalledWith('r1');
+      expect(emit).toHaveBeenCalledWith('sessionEnded', {
+        roomId: 'r1',
+        report,
+      });
+    });
+
+    it('stands down when the owner ends the room first', async () => {
+      const gateway = buildGateway(100);
+      gateway.scheduleSessionEnd(liveRoom(10 * 60_000));
+      gateway.broadcastSessionEnded('r1', report); // manual end via REST
+
+      await jest.advanceTimersByTimeAsync(10 * 60_000);
+      expect(service.expireRoom).not.toHaveBeenCalled();
+    });
+
+    it('broadcasts nothing when the room had already ended by the time it fired', async () => {
+      const gateway = buildGateway(100);
+      service.expireRoom.mockResolvedValue(null);
+      gateway.scheduleSessionEnd(liveRoom(1_000));
+
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(service.expireRoom).toHaveBeenCalledWith('r1');
+      expect(emit).not.toHaveBeenCalledWith('sessionEnded', expect.anything());
+    });
+
+    it('does nothing for a room without a scheduled end', async () => {
+      const gateway = buildGateway(100);
+      gateway.scheduleSessionEnd({ id: 'r1', status: 'live' } as Room);
+
+      await jest.advanceTimersByTimeAsync(60 * 60_000);
+      expect(service.expireRoom).not.toHaveBeenCalled();
     });
   });
 
-  it('broadcasts the end-of-session report and closes the voice mesh', async () => {
+  it('broadcasts the end-of-session report', () => {
     const gateway = buildGateway(8);
     const ada = socket('u1');
     await gateway.handleWebrtcJoin(ada, { roomId: 'r1' });

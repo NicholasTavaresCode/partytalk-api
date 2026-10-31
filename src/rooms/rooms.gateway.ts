@@ -13,13 +13,10 @@ import { Server, Socket } from 'socket.io';
 import { WsAuthenticator } from '../auth/ws-authenticator';
 import { AppConfig } from '../config/configuration';
 import { AuthenticatedPrincipal } from '../common/interfaces/authenticated-principal.interface';
+import { HostMessage, HostTrigger } from './entities/host-message.entity';
+import { Room } from './entities/room.entity';
 import { RoomReport } from './entities/room-report.entity';
-import {
-  SuggestionTrigger,
-  TopicSuggestion,
-} from './entities/topic-suggestion.entity';
-import { shouldSuggestByVolume } from './facilitator/facilitator-policy';
-import { canAccessRoom, normalizeEmail } from './room-access';
+import { shouldEvaluateByVolume } from './facilitator/facilitator-policy';
 import { RoomsService } from './rooms.service';
 
 /** Mirrors PostTranscriptDto's limit for the REST path. */
@@ -60,35 +57,33 @@ type AuthedSocket = Socket & {
   };
 };
 
-/** Per-room facilitator state kept in memory on this socket-server instance. */
+/** Per-room host state kept in memory on this socket-server instance. */
 interface RoomState {
-  sinceLastSuggestion: number;
+  /** Transcript segments captured since the host was last consulted. */
+  sinceLastConsult: number;
   silenceTimer?: ReturnType<typeof setTimeout>;
-  suggesting: boolean;
+  /** Fires at `scheduledEndAt` to end the session server-side. */
+  sessionEndTimer?: ReturnType<typeof setTimeout>;
+  /** A consultation (LLM call) is in flight for this room. */
+  consulting: boolean;
 }
 
 /**
  * Realtime transport for rooms. Participants talk by voice; the client streams
- * speech-to-text as `transcript` events. This gateway broadcasts each segment,
- * persists it via RoomsService, and runs the AI facilitator's auto-triggers:
- * suggest a new topic every N segments (volume) or after X ms of silence.
- * Business logic (LLM, persistence) stays in the service — the gateway only
- * owns the clock and the fan-out.
+ * speech-to-text as `transcript` events. This gateway persists each segment via
+ * RoomsService and broadcasts it, then periodically *consults* the AI host:
+ * every N segments (volume) or after X ms of silence, it lets the host listen
+ * to the recent conversation and decide whether the current topic has been
+ * talked about enough — and broadcasts a `hostMessage` only when the host
+ * actually speaks. It also keeps each room's session clock and ends the session
+ * server-side when the room's length runs out. Business logic (LLM, the
+ * decision, persistence) stays in the service — the gateway only owns the
+ * clock and the fan-out.
  *
- * Rooms are invite-only: entering (`joinRoom`, `webrtc:join`) requires having
- * joined via REST *and* still passing `canAccessRoom`, and `evictFromRoom`
- * kicks a revoked invitee's live sockets out of the room and the voice mesh.
- *
- * It also relays WebRTC signaling (`webrtc:*`) for the P2P voice mesh described
- * in docs/audio-architecture.md (M1). Only tiny SDP/ICE messages pass through
- * here; audio flows browser-to-browser.
- *
- * Who is in a room or its voice mesh lives only in Socket.IO rooms, which the
- * Pub/Sub adapter (PubSubIoAdapter) shares across instances — Cloud Run can run
- * two at once even at max-instances 1. So presence, room updates and WebRTC
- * relays reach sockets on any instance; never keep membership in a local Map.
- * Only the facilitator's counters and silence timers stay per instance: while
- * two instances overlap, a room's nudges may come from either.
+ * NOTE: host state and session timers are in-process, so this assumes a single
+ * socket-server instance (or sticky sessions), and a restart drops pending
+ * timers. A multi-instance deployment would move `RoomState` into a shared
+ * store (e.g. Redis).
  */
 @WebSocketGateway({ namespace: 'rooms', cors: true })
 export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
@@ -97,7 +92,8 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   private readonly logger = new Logger(RoomsGateway.name);
   private readonly rooms = new Map<string, RoomState>();
-  private readonly everySegments: number;
+  /** Consult the host at most once per this many segments (cost bound). */
+  private readonly consultEvery: number;
   private readonly silenceMs: number;
 
   constructor(
@@ -106,7 +102,7 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     config: ConfigService<AppConfig, true>,
   ) {
     const facilitator = config.get('facilitator', { infer: true });
-    this.everySegments = facilitator.suggestEverySegments;
+    this.consultEvery = facilitator.suggestEverySegments;
     this.silenceMs = facilitator.silenceMs;
   }
 
@@ -231,192 +227,50 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     }
 
     const state = this.stateFor(payload.roomId);
-    state.sinceLastSuggestion += 1;
+    state.sinceLastConsult += 1;
     this.scheduleSilenceTrigger(payload.roomId);
 
-    if (shouldSuggestByVolume(state.sinceLastSuggestion, this.everySegments)) {
-      await this.suggestAndBroadcast(payload.roomId, 'volume');
+    if (shouldEvaluateByVolume(state.sinceLastConsult, this.consultEvery)) {
+      await this.consultHost(payload.roomId, 'volume');
     }
   }
 
   /**
-   * Enter the room's voice mesh. Replies with the peers already in it, and the
-   * joiner offers to each of them.
+   * Arm the session clock for a room that just went live: at `scheduledEndAt`
+   * the session is ended server-side (report generated, `sessionEnded`
+   * broadcast). Ending early via REST stands it down (see broadcastSessionEnded).
    */
-  @SubscribeMessage('webrtc:join')
-  async handleWebrtcJoin(
-    @ConnectedSocket() client: AuthedSocket,
-    @MessageBody() payload: JoinRoomPayload,
-  ): Promise<void> {
-    const user = this.requireUser(client);
-    const { roomId } = payload;
-    if (!(await this.mayEnter(client, user, roomId))) {
+  scheduleSessionEnd(room: Room): void {
+    if (!room.scheduledEndAt) {
       return;
     }
-
-    // One voice connection per person: a newer tab or a reconnect takes the
-    // seat over, wherever the older socket lives, so offers never reach two.
-    const seat = voiceSeat(roomId, user.uid);
-    this.server
-      .in(seat)
-      .except(client.id)
-      .socketsLeave([voiceRoom(roomId), seat]);
-    // Join first, then list. When the host starts, everyone joins at once; this
-    // way two simultaneous joiners both see (and offer to) each other, and the
-    // client settles that glare (useVoiceMesh) — rather than each missing the
-    // other and nobody offering at all.
-    await client.join([voiceRoom(roomId), seat]);
-    (client.data.voice ??= new Set()).add(roomId);
-    const uids = (await this.uidsIn(voiceRoom(roomId))).filter(
-      (uid) => uid !== user.uid,
+    const state = this.stateFor(room.id);
+    if (state.sessionEndTimer) {
+      clearTimeout(state.sessionEndTimer);
+    }
+    const delay = Math.max(
+      0,
+      new Date(room.scheduledEndAt).getTime() - Date.now(),
     );
-    client.emit('webrtc:peers', { uids });
-  }
-
-  @SubscribeMessage('webrtc:offer')
-  handleWebrtcOffer(
-    @ConnectedSocket() client: AuthedSocket,
-    @MessageBody() payload: SignalPayload,
-  ): void {
-    this.relay(client, payload, 'webrtc:peer-offer', { sdp: payload.sdp });
-  }
-
-  @SubscribeMessage('webrtc:answer')
-  handleWebrtcAnswer(
-    @ConnectedSocket() client: AuthedSocket,
-    @MessageBody() payload: SignalPayload,
-  ): void {
-    this.relay(client, payload, 'webrtc:peer-answer', { sdp: payload.sdp });
-  }
-
-  @SubscribeMessage('webrtc:ice')
-  handleWebrtcIce(
-    @ConnectedSocket() client: AuthedSocket,
-    @MessageBody() payload: SignalPayload,
-  ): void {
-    this.relay(client, payload, 'webrtc:peer-ice', {
-      candidate: payload.candidate,
-    });
+    state.sessionEndTimer = setTimeout(() => {
+      void this.endSession(room.id);
+    }, delay);
+    state.sessionEndTimer.unref?.();
   }
 
   /**
-   * Kick a revoked invitee out: every socket of theirs (matched by uid or by the
-   * revoked email) leaves the room and the voice mesh and is told why; the room
-   * sees them leave.
+   * Push the authoritative room to everyone already in it after membership or
+   * lifecycle changes made over REST (join, leave, start), so existing clients
+   * never have to reconstruct `participantIds` from `presence` events. Note:
+   * `presence` only reflects socket subscription; this carries membership.
    */
-  async evictFromRoom(
-    roomId: string,
-    uids: string[],
-    email: string,
-  ): Promise<void> {
-    const target = normalizeEmail(email);
-    // Their sockets in the room channel or only in its voice mesh, on any instance.
-    const sockets = new Map<
-      string,
-      Awaited<ReturnType<typeof this.socketsIn>>[number]
-    >();
-    for (const room of [roomId, voiceRoom(roomId)]) {
-      for (const socket of await this.socketsIn(room)) {
-        sockets.set(socket.id, socket);
-      }
-    }
-    const evicted = new Set<string>();
-    for (const socket of sockets.values()) {
-      const user = (socket.data as AuthedSocket['data']).user;
-      if (
-        !user ||
-        !(
-          uids.includes(user.uid) || normalizeEmail(user.email ?? '') === target
-        )
-      ) {
-        continue;
-      }
-      socket.leave(roomId);
-      socket.leave(voiceRoom(roomId));
-      socket.leave(voiceSeat(roomId, user.uid));
-      socket.emit('removedFromRoom', { roomId });
-      evicted.add(user.uid);
-    }
-    for (const uid of evicted) {
-      this.server
-        .to([roomId, voiceRoom(roomId)])
-        .emit('webrtc:peer-left', { uid });
-      this.server.to(roomId).emit('presence', { roomId, uid, event: 'left' });
-    }
+  broadcastRoomUpdated(room: Room): void {
+    this.server.to(room.id).emit('roomUpdated', room);
   }
 
-  /**
-   * Tell everyone in the room that its REST state changed — someone joined or
-   * left, the host started it, an invite was revoked — so each client refetches
-   * `GET /rooms/:id`. Deliberately carries no room data: that endpoint filters
-   * owner-only fields per caller, and broadcasting the room would hand every
-   * participant the invite list and link code.
-   */
-  notifyRoomUpdated(roomId: string): void {
-    this.server.to(roomId).emit('roomUpdated', { roomId });
-  }
-
-  /**
-   * The sockets in a Socket.IO room, across every instance. If another instance
-   * doesn't answer in time (e.g. Cloud Run is retiring it), fall back to this
-   * instance's view rather than failing the event.
-   */
-  private async socketsIn(room: string) {
-    try {
-      return await this.server.in(room).fetchSockets();
-    } catch (error) {
-      this.logger.warn(
-        `fetchSockets(${room}) across instances failed (${(error as Error).message}); using this instance only`,
-      );
-      return this.server.local.in(room).fetchSockets();
-    }
-  }
-
-  /** The distinct people (uids) with a socket in a Socket.IO room. */
-  private async uidsIn(room: string): Promise<string[]> {
-    const uids = new Set<string>();
-    for (const socket of await this.socketsIn(room)) {
-      const user = (socket.data as AuthedSocket['data']).user;
-      if (user) {
-        uids.add(user.uid);
-      }
-    }
-    return [...uids];
-  }
-
-  /** Who is connected to the room right now, one entry per person. */
-  private async membersOf(
-    roomId: string,
-  ): Promise<{ uid: string; name?: string }[]> {
-    const members = new Map<string, string | undefined>();
-    for (const socket of await this.socketsIn(roomId)) {
-      const user = (socket.data as AuthedSocket['data']).user;
-      if (user) {
-        members.set(user.uid, user.name);
-      }
-    }
-    return [...members].map(([uid, name]) => ({ uid, name }));
-  }
-
-  /** Announce `left` only once the person's last socket in the room is gone. */
-  private async announceLeftIfGone(roomId: string, uid: string): Promise<void> {
-    if ((await this.membersOf(roomId)).some((m) => m.uid === uid)) {
-      return; // still here in another tab
-    }
-    this.server.to(roomId).emit('presence', { roomId, uid, event: 'left' });
-  }
-
-  /**
-   * Broadcast a topic the host asked for (REST `suggest-topic`) to the whole
-   * room, and restart the automatic triggers so the AI doesn't pile another
-   * nudge on top of it.
-   */
-  announceSuggestion(roomId: string, suggestion: TopicSuggestion): void {
-    const state = this.rooms.get(roomId);
-    if (state) {
-      this.resetTriggers(state);
-    }
-    this.server.to(roomId).emit('topicSuggested', suggestion);
+  /** Push a line the host said to everyone in the room. */
+  broadcastHostMessage(message: HostMessage): void {
+    this.server.to(message.roomId).emit('hostMessage', message);
   }
 
   /** Broadcast the end-of-session report and drop the room's timers/state. */
@@ -503,36 +357,60 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
       clearTimeout(state.silenceTimer);
     }
     state.silenceTimer = setTimeout(() => {
-      void this.suggestAndBroadcast(roomId, 'silence');
+      void this.consultHost(roomId, 'silence');
     }, this.silenceMs);
-    // Don't keep the event loop alive just for a pending nudge.
+    // Don't keep the event loop alive just for a pending check.
     state.silenceTimer.unref?.();
   }
 
-  private async suggestAndBroadcast(
+  /**
+   * Consult the host for this room. It listens to the conversation and decides
+   * whether to step in; we broadcast a `hostMessage` only when it does. Guarded
+   * so we never run overlapping consultations for the same room.
+   */
+  private async consultHost(
     roomId: string,
-    trigger: SuggestionTrigger,
+    trigger: HostTrigger,
   ): Promise<void> {
     const state = this.stateFor(roomId);
-    if (state.suggesting) {
+    if (state.consulting) {
       return; // avoid overlapping LLM calls for the same room
     }
-    state.suggesting = true;
-    // Reset counters up front so new segments accumulate toward the next nudge.
-    this.resetTriggers(state);
+    state.consulting = true;
+    // Reset the counter up front so new segments accumulate toward the next check.
+    state.sinceLastConsult = 0;
+    if (state.silenceTimer) {
+      clearTimeout(state.silenceTimer);
+      state.silenceTimer = undefined;
+    }
 
     try {
-      const suggestion = await this.roomsService.generateTopicSuggestion(
-        roomId,
-        trigger,
-      );
-      this.server.to(roomId).emit('topicSuggested', suggestion);
+      const message = await this.roomsService.consultHost(roomId, trigger);
+      // null = the host chose to stay quiet; nothing to broadcast.
+      if (message) {
+        this.broadcastHostMessage(message);
+      }
     } catch (error) {
       this.logger.warn(
-        `Topic suggestion failed for room ${roomId}: ${(error as Error).message}`,
+        `Host consultation failed for room ${roomId}: ${(error as Error).message}`,
       );
     } finally {
-      state.suggesting = false;
+      state.consulting = false;
+    }
+  }
+
+  /** Time is up: end the session and tell the room, unless the owner already did. */
+  private async endSession(roomId: string): Promise<void> {
+    try {
+      const room = await this.roomsService.expireRoom(roomId);
+      // null = the owner ended it first; `sessionEnded` already went out then.
+      if (room) {
+        this.broadcastSessionEnded(roomId, room.report);
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Ending room ${roomId} on time failed: ${(error as Error).message}`,
+      );
     }
   }
 
@@ -557,7 +435,7 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
   private stateFor(roomId: string): RoomState {
     let state = this.rooms.get(roomId);
     if (!state) {
-      state = { sinceLastSuggestion: 0, suggesting: false };
+      state = { sinceLastConsult: 0, consulting: false };
       this.rooms.set(roomId, state);
     }
     return state;
@@ -567,6 +445,9 @@ export class RoomsGateway implements OnGatewayInit, OnGatewayDisconnect {
     const state = this.rooms.get(roomId);
     if (state?.silenceTimer) {
       clearTimeout(state.silenceTimer);
+    }
+    if (state?.sessionEndTimer) {
+      clearTimeout(state.sessionEndTimer);
     }
     this.rooms.delete(roomId);
   }

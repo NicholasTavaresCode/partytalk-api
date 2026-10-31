@@ -1,10 +1,10 @@
+import { HostMessage } from './entities/host-message.entity';
 import { Room } from './entities/room.entity';
-import { TopicSuggestion } from './entities/topic-suggestion.entity';
 import { TranscriptSegment } from './entities/transcript-segment.entity';
 
 /**
- * Persistence contract for rooms, their voice-transcript stream and the AI's
- * topic suggestions. Abstracted from Firestore so the service is unit-testable
+ * Persistence contract for rooms, their voice-transcript stream and the lines
+ * the AI host said. Abstracted from Firestore so the service is unit-testable
  * with an in-memory fake (arch-use-repository-pattern). Used as a DI token via
  * `useClass`.
  */
@@ -29,23 +29,26 @@ export abstract class RoomsRepository {
 
   abstract addSegment(segment: TranscriptSegment): Promise<TranscriptSegment>;
 
-  /**
-   * A room's most recent `limit` transcript segments, in chronological order
-   * (oldest first) — the facilitator's rolling context window.
-   */
+  /** The first `limit` transcript segments of a room, oldest first. */
   abstract listSegments(
     roomId: string,
     limit: number,
   ): Promise<TranscriptSegment[]>;
 
-  /** Total number of transcript segments captured for a room. */
-  abstract countSegments(roomId: string): Promise<number>;
-
-  abstract addSuggestion(suggestion: TopicSuggestion): Promise<TopicSuggestion>;
-
-  /** A room's most recent `limit` topic suggestions, oldest first. */
-  abstract listSuggestions(
+  /**
+   * The `limit` MOST RECENT transcript segments of a room, still in
+   * chronological order — the window the host listens to on each turn.
+   */
+  abstract listRecentSegments(
     roomId: string,
     limit: number,
-  ): Promise<TopicSuggestion[]>;
+  ): Promise<TranscriptSegment[]>;
+
+  abstract addHostMessage(message: HostMessage): Promise<HostMessage>;
+
+  /** Everything the host has said in a room, oldest first. */
+  abstract listHostMessages(
+    roomId: string,
+    limit: number,
+  ): Promise<HostMessage[]>;
 }

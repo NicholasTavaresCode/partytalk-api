@@ -44,15 +44,15 @@ export interface AppConfig {
   };
   vertex: {
     location: string;
+    /** Gemini model behind the AI host (in-room lines + end-of-session report). */
     hostModel: string;
-    scoringModel: string;
   };
   facilitator: {
-    /** Suggest a new topic after this many transcript segments since the last one. */
+    /** Consult the host after this many transcript segments since it was last consulted. */
     suggestEverySegments: number;
-    /** Suggest a new topic after this many milliseconds of silence in a live room. */
+    /** Consult the host after this many milliseconds of silence in a live room. */
     silenceMs: number;
-    /** How many recent transcript segments to feed the model as context. */
+    /** How many of the most recent transcript segments the host listens to per turn. */
     contextSegments: number;
   };
   /** Outgoing email (room invitations). Off unless SMTP user + password are set. */
@@ -118,8 +118,7 @@ export default (): AppConfig => ({
   },
   vertex: {
     location: process.env.VERTEX_LOCATION ?? 'us-central1',
-    hostModel: process.env.VERTEX_HOST_MODEL ?? 'gemini-2.0-flash',
-    scoringModel: process.env.VERTEX_SCORING_MODEL ?? 'gemini-2.0-flash',
+    hostModel: process.env.VERTEX_HOST_MODEL ?? 'gemini-2.5-flash-lite',
   },
   facilitator: {
     suggestEverySegments: parseInt(

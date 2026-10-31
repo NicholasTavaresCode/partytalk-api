@@ -2,24 +2,22 @@ import {
   ConflictException,
   ForbiddenException,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import { LlmProvider } from '../ai/llm-provider';
+import { HostMessage } from './entities/host-message.entity';
 import { Room } from './entities/room.entity';
-import { TopicSuggestion } from './entities/topic-suggestion.entity';
 import { TranscriptSegment } from './entities/transcript-segment.entity';
-import { User } from '../users/entities/user.entity';
-import { UsersRepository } from '../users/users.repository';
-import { RoomCaller } from './room-access';
-import { RoomInvitations } from './room-invitations';
+import { OPENING_TOPIC_AREAS } from './facilitator/facilitator-prompts';
 import { RoomsRepository } from './rooms.repository';
 import { RoomsService } from './rooms.service';
 
 class InMemoryRoomsRepository extends RoomsRepository {
   rooms = new Map<string, Room>();
   segments: TranscriptSegment[] = [];
-  suggestions: TopicSuggestion[] = [];
+  hostMessages: HostMessage[] = [];
 
   async findById(id: string) {
     return this.rooms.get(id) ?? null;
@@ -59,33 +57,27 @@ class InMemoryRoomsRepository extends RoomsRepository {
   async listSegments(roomId: string, limit: number) {
     return this.segments.filter((s) => s.roomId === roomId).slice(-limit);
   }
-  async countSegments(roomId: string) {
-    return this.segments.filter((s) => s.roomId === roomId).length;
+  async listRecentSegments(roomId: string, limit: number) {
+    const all = this.segments.filter((s) => s.roomId === roomId);
+    return all.slice(Math.max(0, all.length - limit));
   }
-  async addSuggestion(suggestion: TopicSuggestion) {
-    this.suggestions.push(suggestion);
-    return suggestion;
+  async addHostMessage(message: HostMessage) {
+    this.hostMessages.push(message);
+    return message;
   }
-  async listSuggestions(roomId: string, limit: number) {
-    return this.suggestions.filter((s) => s.roomId === roomId).slice(-limit);
+  async listHostMessages(roomId: string, limit: number) {
+    return this.hostMessages.filter((m) => m.roomId === roomId).slice(0, limit);
   }
 }
 
-/** Users keyed by uid — just enough for revokeInvite's uid → email lookup. */
-class InMemoryUsersRepository extends UsersRepository {
-  users = new Map<string, User>();
-  async findById(id: string) {
-    return this.users.get(id) ?? null;
-  }
-  async create(user: User) {
-    this.users.set(user.id, user);
-    return user;
-  }
-  async update() {
-    return null;
-  }
-  async delete() {}
-}
+const SPEAK = (message: string, topic: string) =>
+  JSON.stringify({ shouldSpeak: true, message, topic, reason: 'time to move' });
+const STAY_QUIET = JSON.stringify({
+  shouldSpeak: false,
+  message: 'unused',
+  topic: 'unused',
+  reason: 'talk is flowing',
+});
 
 describe('RoomsService', () => {
   let service: RoomsService;
@@ -99,7 +91,7 @@ describe('RoomsService', () => {
   const BO: RoomCaller = { uid: 'user-2', email: 'bo@example.com' };
   const CY: RoomCaller = { uid: 'user-3', email: 'cy@example.com' };
 
-  beforeEach(async () => {
+  const build = async (contextSegments = 25): Promise<void> => {
     llm = { generate: jest.fn() };
     invitations = { send: jest.fn() };
     const moduleRef = await Test.createTestingModule({
@@ -112,19 +104,11 @@ describe('RoomsService', () => {
         {
           provide: ConfigService,
           useValue: {
-            get: (key: string) =>
-              key === 'webrtc'
-                ? {
-                    stunUrls: ['stun:stun.example:3478'],
-                    turnUrls: ['turn:203.0.113.7:3478'],
-                    turnSecret: 's3cret',
-                    turnCredentialTtlSeconds: 3600,
-                  }
-                : {
-                    suggestEverySegments: 8,
-                    silenceMs: 25_000,
-                    contextSegments: 25,
-                  },
+            get: () => ({
+              suggestEverySegments: 8,
+              silenceMs: 25_000,
+              contextSegments,
+            }),
           },
         },
       ],
@@ -132,8 +116,9 @@ describe('RoomsService', () => {
 
     service = moduleRef.get(RoomsService);
     repo = moduleRef.get(RoomsRepository);
-    users = moduleRef.get(UsersRepository);
-  });
+  };
+
+  beforeEach(() => build());
 
   const createLiveRoom = async (): Promise<Room> => {
     const room = await service.createRoom(OWNER_CALLER, {
@@ -142,15 +127,17 @@ describe('RoomsService', () => {
     return service.startRoom(room.id, OWNER);
   };
 
+  /** The user-message content of the last prompt sent to the model. */
+  const lastPromptContent = (): string =>
+    llm.generate.mock.calls.at(-1)?.[0].messages[0].content;
+
   describe('createRoom', () => {
-    it('creates a waiting room owned by the caller with a default persona', async () => {
-      const room = await service.createRoom(OWNER_CALLER, {
-        topic: 'Weekend plans',
-      });
+    it('creates a waiting room owned by the caller', async () => {
+      const room = await service.createRoom(OWNER, { topic: 'Weekend plans' });
       expect(room.status).toBe('waiting');
       expect(room.ownerId).toBe(OWNER);
       expect(room.participantIds).toEqual([OWNER]);
-      expect(room.facilitatorPersona).toBeTruthy();
+      expect(room.durationMinutes).toBe(30);
       expect(room.createdAt).toEqual(room.updatedAt);
       expect(room.invitedEmails).toEqual([]);
       expect(room.inviteCode).toBeNull();
@@ -166,6 +153,59 @@ describe('RoomsService', () => {
         ],
       });
       expect(room.invitedEmails).toEqual(['bo@example.com']);
+    });
+
+    it('stores the chosen session length', async () => {
+      const room = await service.createRoom(OWNER, {
+        topic: 'Weekend plans',
+        durationMinutes: 15,
+      });
+      expect(room.durationMinutes).toBe(15);
+    });
+
+    it('does not consult the host when the creator picks the topic', async () => {
+      const room = await service.createRoom(OWNER, { topic: 'Weekend plans' });
+      expect(room.topicPickedByHost).toBe(false);
+      expect(llm.generate).not.toHaveBeenCalled();
+    });
+
+    it('lets the AI host pick the opening topic when asked', async () => {
+      llm.generate.mockResolvedValue({
+        text: '{"topic":"The Usain Bolt 100m record"}',
+      });
+
+      const room = await service.createRoom(OWNER, { hostPicksTopic: true });
+
+      expect(room.topic).toBe('The Usain Bolt 100m record');
+      expect(room.topicPickedByHost).toBe(true);
+      expect(llm.generate).toHaveBeenCalledWith(
+        expect.objectContaining({ json: true }),
+      );
+      const content = lastPromptContent();
+      expect(OPENING_TOPIC_AREAS.some((area) => content.includes(area))).toBe(
+        true,
+      );
+      expect(await repo.findById(room.id)).not.toBeNull();
+    });
+
+    it('ignores a creator topic when the host picks', async () => {
+      llm.generate.mockResolvedValue({ text: '{"topic":"The movie Titanic"}' });
+
+      const room = await service.createRoom(OWNER, {
+        hostPicksTopic: true,
+        topic: 'Weekend plans',
+      });
+
+      expect(room.topic).toBe('The movie Titanic');
+    });
+
+    it('fails with 503 and creates nothing when the host cannot pick', async () => {
+      llm.generate.mockRejectedValue(new Error('LLM down'));
+
+      await expect(
+        service.createRoom(OWNER, { hostPicksTopic: true }),
+      ).rejects.toThrow(ServiceUnavailableException);
+      expect(repo.rooms.size).toBe(0);
     });
   });
 
@@ -418,6 +458,37 @@ describe('RoomsService', () => {
       expect(room.status).toBe('live');
       expect(llm.generate).not.toHaveBeenCalled();
     });
+
+    it('starts the clock: stamps startedAt and scheduledEndAt from the session length', async () => {
+      const room = await service.createRoom(OWNER, {
+        topic: 'Weekend plans',
+        durationMinutes: 45,
+      });
+
+      const live = await service.startRoom(room.id, OWNER);
+
+      expect(live.startedAt).toBeTruthy();
+      expect(
+        new Date(live.scheduledEndAt ?? '').getTime() -
+          new Date(live.startedAt ?? '').getTime(),
+      ).toBe(45 * 60_000);
+    });
+
+    it('refuses to start a room twice (that would extend the session)', async () => {
+      const room = await createLiveRoom();
+      await expect(service.startRoom(room.id, OWNER)).rejects.toThrow(
+        ConflictException,
+      );
+    });
+
+    it('refuses to start an ended room', async () => {
+      const room = await createLiveRoom();
+      llm.generate.mockResolvedValue({ text: '{"summary":"ok"}' });
+      await service.endRoom(room.id, OWNER);
+      await expect(service.startRoom(room.id, OWNER)).rejects.toThrow(
+        ConflictException,
+      );
+    });
   });
 
   describe('addTranscriptSegment', () => {
@@ -435,7 +506,7 @@ describe('RoomsService', () => {
       expect(seg.speakerName).toBe('Bo');
       expect(seg.text).toBe('I want to visit the coast.');
       expect(seg.id).toBeTruthy();
-      expect(await repo.countSegments(room.id)).toBe(1);
+      expect(await repo.listSegments(room.id, 10)).toHaveLength(1);
     });
 
     it('rejects segments for a missing room', async () => {
@@ -445,72 +516,118 @@ describe('RoomsService', () => {
     });
   });
 
-  describe('buildTranscriptSegment / saveTranscriptSegment', () => {
-    it('stamps a segment without persisting until saved', async () => {
-      const seg = service.buildTranscriptSegment(
-        'r1',
-        { uid: 'user-2', name: 'Bo' },
-        'hello',
-      );
-      expect(seg).toMatchObject({
-        roomId: 'r1',
-        speakerId: 'user-2',
-        speakerName: 'Bo',
-        text: 'hello',
-      });
-      expect(seg.id).toBeTruthy();
-      expect(await repo.countSegments('r1')).toBe(0);
-
-      await service.saveTranscriptSegment(seg);
-      expect(await repo.countSegments('r1')).toBe(1);
-    });
-  });
-
-  describe('generateTopicSuggestion', () => {
-    it('feeds the model the most recent window, not the start of the conversation', async () => {
-      const room = await createLiveRoom(); // contextSegments is 25 in this suite
-      for (let i = 0; i < 30; i++) {
-        await service.addTranscriptSegment(
-          room.id,
-          OWNER_CALLER,
-          `utterance-${String(i).padStart(2, '0')}`,
-        );
-      }
-      llm.generate.mockResolvedValue({
-        text: '{"topic":"Next","rationale":"why"}',
-      });
-
-      await service.generateTopicSuggestion(room.id, 'volume');
-
-      const prompt = JSON.stringify(llm.generate.mock.calls[0][0]);
-      expect(prompt).toContain('utterance-29');
-      expect(prompt).toContain('utterance-05');
-      expect(prompt).not.toContain('utterance-04');
-    });
-
-    it('asks the model for JSON, parses it, and persists the suggestion', async () => {
+  describe('forceTopicChange (manual override)', () => {
+    it('makes the host speak even when it would have stayed quiet', async () => {
       const room = await createLiveRoom();
       await service.addTranscriptSegment(
         room.id,
-        OWNER_CALLER,
+        { uid: 'u2' },
         'I love surfing.',
       );
       llm.generate.mockResolvedValue({
-        text: '{"topic":"Dream coastlines","rationale":"builds on surfing"}',
+        text: JSON.stringify({
+          shouldSpeak: false,
+          message: "Ok. Now let's talk about the Usain Bolt record.",
+          topic: 'The Usain Bolt record',
+          reason: 'asked for a change',
+        }),
       });
 
-      const suggestion = await service.generateTopicSuggestion(
-        room.id,
-        'volume',
-      );
+      const said = await service.forceTopicChange(room.id);
 
       expect(llm.generate).toHaveBeenCalledWith(
         expect.objectContaining({ json: true }),
       );
-      expect(suggestion.topic).toBe('Dream coastlines');
-      expect(suggestion.rationale).toBe('builds on surfing');
-      expect(suggestion.trigger).toBe('volume');
-      expect(await repo.listSuggestions(room.id, 10)).toHaveLength(1);
+      expect(lastPromptContent()).toContain('asked you to change the topic');
+      expect(said.message).toBe(
+        "Ok. Now let's talk about the Usain Bolt record.",
+      );
+      expect(said.topic).toBe('The Usain Bolt record');
+      expect(said.reason).toBe('asked for a change');
+      expect(said.trigger).toBe('manual');
+      expect(said.roomId).toBe(room.id);
+      expect(await repo.listHostMessages(room.id, 10)).toHaveLength(1);
+    });
+  });
+
+  describe('consultHost (auto)', () => {
+    it('persists and returns the line when the host decides to step in', async () => {
+      const room = await createLiveRoom();
+      await service.addTranscriptSegment(room.id, { uid: 'u2' }, '...');
+      llm.generate.mockResolvedValue({
+        text: SPEAK(
+          "All right. Let's talk about the incredible movie Titanic.",
+          'The movie Titanic',
+        ),
+      });
+
+      const said = await service.consultHost(room.id, 'silence');
+
+      expect(said).not.toBeNull();
+      expect(said?.message).toBe(
+        "All right. Let's talk about the incredible movie Titanic.",
+      );
+      expect(said?.topic).toBe('The movie Titanic');
+      expect(said?.trigger).toBe('silence');
+      expect(await repo.listHostMessages(room.id, 10)).toHaveLength(1);
+    });
+
+    it('returns null and persists nothing when the host stays quiet', async () => {
+      const room = await createLiveRoom();
+      await service.addTranscriptSegment(
+        room.id,
+        { uid: 'u2' },
+        'Great point!',
+      );
+      llm.generate.mockResolvedValue({ text: STAY_QUIET });
+
+      const said = await service.consultHost(room.id, 'volume');
+
+      expect(said).toBeNull();
+      expect(await repo.listHostMessages(room.id, 10)).toHaveLength(0);
+    });
+
+    it('listens to the MOST RECENT segments, not the first ones', async () => {
+      await build(2); // the host only hears the last two utterances
+      const room = await createLiveRoom();
+      for (const text of ['first thing', 'second thing', 'third thing']) {
+        await service.addTranscriptSegment(room.id, { uid: 'u2' }, text);
+      }
+      llm.generate.mockResolvedValue({ text: STAY_QUIET });
+
+      await service.consultHost(room.id, 'volume');
+
+      const content = lastPromptContent();
+      expect(content).toContain('second thing');
+      expect(content).toContain('third thing');
+      expect(content).not.toContain('first thing');
+    });
+
+    it('reminds the host what it already said so it never reuses a topic', async () => {
+      const room = await createLiveRoom();
+      await service.addTranscriptSegment(room.id, { uid: 'u2' }, 'Hi all.');
+      llm.generate.mockResolvedValue({
+        text: SPEAK(
+          "Ok. Now let's talk about the Usain Bolt record.",
+          'The Usain Bolt record',
+        ),
+      });
+      await service.consultHost(room.id, 'volume');
+      await service.addTranscriptSegment(
+        room.id,
+        { uid: 'u2' },
+        'He ran 9.58!',
+      );
+      llm.generate.mockResolvedValue({ text: STAY_QUIET });
+
+      await service.consultHost(room.id, 'volume');
+
+      const content = lastPromptContent();
+      expect(content).toContain(
+        "Host (you): Ok. Now let's talk about the Usain Bolt record.",
+      );
+      expect(content).toContain('Current topic: "The Usain Bolt record"');
+      expect(content).toContain('"Weekend plans", "The Usain Bolt record"');
     });
   });
 
@@ -566,7 +683,7 @@ describe('RoomsService', () => {
       const room = await createLiveRoom();
       await service.addTranscriptSegment(
         room.id,
-        OWNER_CALLER,
+        { uid: 'u2' },
         'I love surfing.',
       );
       llm.generate.mockResolvedValue({
@@ -582,6 +699,22 @@ describe('RoomsService', () => {
       expect(ended.report?.generatedAt).toBeTruthy();
     });
 
+    it("feeds the host's topic changes into the report", async () => {
+      const room = await createLiveRoom();
+      await service.addTranscriptSegment(room.id, { uid: 'u2' }, 'Hi all.');
+      llm.generate.mockResolvedValue({
+        text: SPEAK("Ok. Now let's talk about Titanic.", 'Titanic'),
+      });
+      await service.consultHost(room.id, 'volume');
+      llm.generate.mockResolvedValue({ text: '{"summary":"ok"}' });
+
+      await service.endRoom(room.id, OWNER);
+
+      expect(lastPromptContent()).toContain(
+        "Host: Ok. Now let's talk about Titanic.",
+      );
+    });
+
     it('still ends the room if report generation fails', async () => {
       const room = await createLiveRoom();
       llm.generate.mockRejectedValue(new Error('LLM down'));
@@ -590,6 +723,29 @@ describe('RoomsService', () => {
 
       expect(ended.status).toBe('ended');
       expect(ended.report).toBeUndefined();
+    });
+  });
+
+  describe('expireRoom (time is up)', () => {
+    it('ends a live room with a report, with no owner involved', async () => {
+      const room = await createLiveRoom();
+      llm.generate.mockResolvedValue({ text: '{"summary":"Time flew"}' });
+
+      const ended = await service.expireRoom(room.id);
+
+      expect(ended?.status).toBe('ended');
+      expect(ended?.endedAt).toBeTruthy();
+      expect(ended?.report?.summary).toBe('Time flew');
+    });
+
+    it('is a no-op when the owner already ended the room', async () => {
+      const room = await createLiveRoom();
+      llm.generate.mockResolvedValue({ text: '{"summary":"ok"}' });
+      await service.endRoom(room.id, OWNER);
+      llm.generate.mockClear();
+
+      expect(await service.expireRoom(room.id)).toBeNull();
+      expect(llm.generate).not.toHaveBeenCalled();
     });
   });
 

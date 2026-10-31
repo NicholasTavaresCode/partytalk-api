@@ -35,7 +35,9 @@ describe('vertex-mapping', () => {
     it('joins and trims candidate parts', () => {
       expect(
         extractText({
-          candidates: [{ content: { parts: [{ text: ' Hello ' }, { text: 'world' }] } }],
+          candidates: [
+            { content: { parts: [{ text: ' Hello ' }, { text: 'world' }] } },
+          ],
         }),
       ).toBe('Hello world');
     });

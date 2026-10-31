@@ -38,7 +38,6 @@ export class UsersService {
         status: authUser.status,
         displayName: dto.displayName,
         englishLevel: dto.englishLevel,
-        targetIeltsBand: dto.targetIeltsBand,
         createdAt: now,
         updatedAt: now,
       });
@@ -47,7 +46,6 @@ export class UsersService {
     const updated = await this.usersRepository.update(authUser.uid, {
       displayName: dto.displayName,
       englishLevel: dto.englishLevel,
-      targetIeltsBand: dto.targetIeltsBand,
       email: authUser.email ?? existing.email,
       updatedAt: now,
     });
